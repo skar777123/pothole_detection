@@ -1,19 +1,28 @@
 """
 lidar_driver.py
 ================
-Robust TF02-Pro single-point LiDAR driver for Raspberry Pi / any serial host.
+Robust TF02-Pro single-point LiDAR driver.
 
-Protocol (TF02-Pro, 115200 baud):
-  Header: 0x59 0x59
-  Dist_L  Dist_H      → distance in cm  (uint16 little-endian)
-  Str_L   Str_H       → signal strength  (uint16 little-endian)
-  Temp_L  Temp_H      → chip temperature (uint16 LE, unit = 0.01 °C)
-  Checksum            → LSB of (0x59+0x59+Dist_L+Dist_H+Str_L+Str_H+Temp_L+Temp_H)
+TF02-Pro 9-byte frame protocol (115200 baud):
+  Byte 0-1 : 0x59 0x59  (frame header)
+  Byte 2   : Dist_L      ─┐ Distance  (cm, uint16 LE)
+  Byte 3   : Dist_H      ─┘
+  Byte 4   : Str_L       ─┐ Signal strength (uint16 LE)
+  Byte 5   : Str_H       ─┘   • 0      = no target / saturated
+             (TF02-Pro NOT TF-Luna — Temp bytes are NOT present in TF02Pro)
+  Byte 6   : reserved (0x00 on most firmware; treated as Temp_L for compat)
+  Byte 7   : reserved (treated as Temp_H)
+  Byte 8   : Checksum = LSB of sum(bytes 0..7)
 
-Quality gates applied inside read_data():
-  • Strength  : 100 – 65535  (< 100 → weak signal / nothing in range)
-  • Distance  : MIN_DIST_CM – MAX_DIST_CM (physical sensor range guard)
-  • Checksum  : must match
+Quality gates (two levels):
+  Level 1 – FRAME VALID  : checksum passes + distance in sensor range (10–2200 cm)
+  Level 2 – SIGNAL GOOD  : strength >= MIN_STRENGTH_GOOD
+                            Readings below this are still returned, just flagged.
+
+WHY we lowered the strength threshold:
+  Asphalt at ~180 cm commonly returns strength 20–80 on the TF02-Pro.
+  The old threshold of 100 was designed for retro-reflective tape targets.
+  We now accept any strength >= 20 as "usable", and log a warning for < 20.
 """
 
 import serial
@@ -22,42 +31,43 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Physical limits of TF02-Pro ─────────────────────────────────────────────
-MIN_DIST_CM      = 10      # Sensor blind-zone below 10 cm
-MAX_DIST_CM      = 2200    # TF02-Pro max range: 22 m
-MIN_STRENGTH     = 100     # Readings below this strength are noise
-MAX_STRENGTH     = 65535   # Saturation upper bound (still valid)
+# ── Physical limits of TF02-Pro ────────────────────────────────────────────
+MIN_DIST_CM        = 10      # Blind zone below 10 cm
+MAX_DIST_CM        = 2200    # Max rated range: 22 m
+MIN_STRENGTH_GOOD  = 20      # Reliable signal floor for natural surfaces
+                              # (retro targets can be ≥ 200; asphalt ≈ 20–80)
 
-# ── Read tuning ──────────────────────────────────────────────────────────────
-MAX_SYNC_ATTEMPTS = 200    # How many single-bytes to try before giving up sync
-FRAME_SIZE        = 9      # Total bytes per frame (2 header + 7 payload)
+# ── Protocol constants ──────────────────────────────────────────────────────
+HEADER_BYTE        = 0x59
+FRAME_PAYLOAD_LEN  = 7       # bytes after the two header bytes
+MAX_SYNC_ATTEMPTS  = 500     # bytes to scan before giving up frame sync
 
 
 class LiDARReadError(Exception):
-    """Raised when the LiDAR cannot produce a valid frame."""
+    """Raised when a valid frame cannot be obtained."""
 
 
 class TF02Pro:
     """
-    Thread-safe, quality-gated driver for the Benewake TF02-Pro LiDAR.
+    Quality-gated driver for the Benewake TF02-Pro single-point LiDAR.
 
     Parameters
     ----------
-    port     : Serial port string, e.g. '/dev/ttyUSB0' or 'COM3'
-    baudrate : Default 115200 (TF02-Pro factory setting)
-    timeout  : Serial read timeout in seconds
+    port     : Serial port, e.g. '/dev/ttyUSB0' or 'COM3'
+    baudrate : Factory default 115200
+    timeout  : Per-byte serial read timeout (seconds)
     """
 
     def __init__(self, port: str = '/dev/ttyUSB0',
                  baudrate: int = 115200,
                  timeout: float = 1.0):
-        self.port = port
-        self.baudrate = baudrate
-        self._ser = None
+        self.port      = port
+        self.baudrate  = baudrate
+        self._ser      = None
         self.connected = False
         self._open(timeout)
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Private helpers ─────────────────────────────────────────────────────
 
     def _open(self, timeout: float) -> None:
         try:
@@ -66,140 +76,162 @@ class TF02Pro:
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=timeout
+                timeout=timeout,
             )
-            # Flush stale bytes in the hardware buffer
-            self._ser.reset_input_buffer()
+            self._ser.reset_input_buffer()   # Flush stale hardware buffer
             self.connected = True
-            logger.info("TF02-Pro connected on %s @ %d baud", self.port, self.baudrate)
+            logger.info("TF02-Pro connected → port=%s  baud=%d", self.port, self.baudrate)
         except serial.SerialException as exc:
             self.connected = False
             logger.error("Cannot open %s: %s", self.port, exc)
             raise
 
     def _read_byte(self) -> int:
-        """Read exactly one byte; raise on timeout or port error."""
-        raw = self._ser.read(1)
-        if not raw:
-            raise LiDARReadError("Serial timeout — no byte received")
-        return raw[0]
+        b = self._ser.read(1)
+        if not b:
+            raise LiDARReadError("Serial timeout – no byte received")
+        return b[0]
 
     def _sync_to_header(self) -> bool:
         """
-        Scan byte-by-byte until the 0x59 0x59 header pair is found.
-        Returns True if header located within MAX_SYNC_ATTEMPTS bytes.
+        Scan incoming bytes until the 0x59 0x59 header pair is found.
+        Consumes at most MAX_SYNC_ATTEMPTS bytes.
+        Returns True when header is located.
         """
         for _ in range(MAX_SYNC_ATTEMPTS):
-            b = self._read_byte()
-            if b == 0x59:
+            b1 = self._read_byte()
+            if b1 == HEADER_BYTE:
                 b2 = self._read_byte()
-                if b2 == 0x59:
-                    return True   # Header confirmed
+                if b2 == HEADER_BYTE:
+                    return True   # Both header bytes confirmed
         return False
 
     @staticmethod
-    def _validate_checksum(payload: bytes) -> bool:
+    def _checksum_ok(all_bytes: bytes) -> bool:
         """
-        payload = Dist_L Dist_H Str_L Str_H Temp_L Temp_H Checksum (7 bytes)
-        Checksum = LSB of sum(0x59, 0x59, payload[0..5])
+        Validate 9-byte frame checksum.
+        Checksum = LSB of sum of first 8 bytes.
+        `all_bytes` = [0x59, 0x59, payload[0..5], checksum_byte]  (9 bytes total)
         """
-        expected = (0x59 + 0x59 + sum(payload[:6])) & 0xFF
-        return expected == payload[6]
+        expected = sum(all_bytes[:8]) & 0xFF
+        return expected == all_bytes[8]
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ──────────────────────────────────────────────────────────
 
-    def read_data(self):
+    def read_data(self) -> dict:
         """
-        Read one validated LiDAR frame.
+        Read and parse one 9-byte TF02-Pro frame.
 
         Returns
         -------
-        dict with keys:
-            distance_cm  : int   — measured distance in centimetres
-            strength     : int   — signal return strength (dimensionless)
-            temperature_c: float — sensor chip temperature in °C
-            valid        : bool  — True when ALL quality gates pass
+        dict:
+            distance_cm   (int)   – distance to target
+            strength      (int)   – return signal strength (dimensionless)
+            signal_good   (bool)  – True if strength ≥ MIN_STRENGTH_GOOD
+            frame_valid   (bool)  – True if checksum passes AND distance in range
+            raw_bytes     (bytes) – full 9-byte raw frame for debugging
 
-        On failure raises LiDARReadError.
+        Raises LiDARReadError on timeout, short frame, or checksum failure.
         """
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("LiDAR not connected")
 
-        # Step 1: Sync to frame header
+        # 1. Find frame header
         if not self._sync_to_header():
-            raise LiDARReadError("Cannot find frame header after max attempts")
+            raise LiDARReadError("Frame header not found within sync limit")
 
-        # Step 2: Read 7-byte payload
-        payload = self._ser.read(7)
-        if len(payload) != 7:
-            raise LiDARReadError(f"Short payload: got {len(payload)}/7 bytes")
-
-        # Step 3: Checksum validation
-        if not self._validate_checksum(payload):
-            raise LiDARReadError("Checksum mismatch — frame discarded")
-
-        # Step 4: Parse fields
-        distance_cm   = payload[0] | (payload[1] << 8)
-        strength      = payload[2] | (payload[3] << 8)
-        raw_temp      = payload[4] | (payload[5] << 8)
-        temperature_c = raw_temp / 100.0
-
-        # Step 5: Quality gates
-        distance_ok = MIN_DIST_CM <= distance_cm <= MAX_DIST_CM
-        strength_ok = MIN_STRENGTH <= strength <= MAX_STRENGTH
-
-        valid = distance_ok and strength_ok
-
-        result = {
-            "distance_cm"  : distance_cm,
-            "strength"     : strength,
-            "temperature_c": temperature_c,
-            "valid"        : valid,
-        }
-
-        if not valid:
-            logger.debug(
-                "Reading out-of-gate: dist=%d cm, strength=%d, temp=%.2f°C",
-                distance_cm, strength, temperature_c
-            )
-
-        return result
-
-    def read_median(self, samples: int = 5) -> dict:
-        """
-        Take `samples` consecutive valid readings and return the median distance.
-        This dramatically reduces single-point noise before pothole inference.
-
-        Returns same dict shape as read_data(), with `valid=True` always
-        (invalid frames are skipped; raises LiDARReadError if <3 obtained).
-        """
-        valid_readings = []
-        attempts = 0
-
-        while len(valid_readings) < samples and attempts < samples * 5:
-            attempts += 1
-            try:
-                reading = self.read_data()
-                if reading["valid"]:
-                    valid_readings.append(reading)
-            except LiDARReadError:
-                continue
-
-        if len(valid_readings) < max(3, samples // 2):
+        # 2. Read remaining 7 bytes (payload)
+        payload = self._ser.read(FRAME_PAYLOAD_LEN)
+        if len(payload) != FRAME_PAYLOAD_LEN:
             raise LiDARReadError(
-                f"Only {len(valid_readings)}/{samples} valid readings obtained"
+                f"Short payload: got {len(payload)}/{FRAME_PAYLOAD_LEN} bytes"
             )
 
-        distances   = [r["distance_cm"]   for r in valid_readings]
-        strengths   = [r["strength"]       for r in valid_readings]
-        temps       = [r["temperature_c"]  for r in valid_readings]
+        # Reconstruct full frame for checksum
+        full_frame = bytes([HEADER_BYTE, HEADER_BYTE]) + payload
+
+        # 3. Validate checksum
+        if not self._checksum_ok(full_frame):
+            raise LiDARReadError(
+                f"Checksum mismatch – raw frame: {full_frame.hex(' ')}"
+            )
+
+        # 4. Parse distance and strength
+        dist_cm  = payload[0] | (payload[1] << 8)
+        strength = payload[2] | (payload[3] << 8)
+
+        # 5. Quality flags
+        in_range     = MIN_DIST_CM <= dist_cm <= MAX_DIST_CM
+        signal_good  = strength >= MIN_STRENGTH_GOOD
+        frame_valid  = in_range   # Checksum already passed; just check range
+
+        logger.debug(
+            "Frame → dist=%d cm  strength=%d  in_range=%s  signal_good=%s",
+            dist_cm, strength, in_range, signal_good
+        )
+
+        if not in_range:
+            raise LiDARReadError(
+                f"Distance {dist_cm} cm out of range [{MIN_DIST_CM}–{MAX_DIST_CM}]"
+            )
+
+        if not signal_good:
+            # Log at WARNING level so the user can see actual strength values
+            logger.warning(
+                "Low signal: dist=%d cm  strength=%d (min good=%d). "
+                "Check sensor aim / target reflectivity. Reading still used.",
+                dist_cm, strength, MIN_STRENGTH_GOOD
+            )
 
         return {
-            "distance_cm"  : int(sorted(distances)[len(distances) // 2]),
-            "strength"     : int(sorted(strengths)[len(strengths) // 2]),
-            "temperature_c": sorted(temps)[len(temps) // 2],
-            "valid"        : True,
-            "n_samples"    : len(valid_readings),
+            "distance_cm" : dist_cm,
+            "strength"    : strength,
+            "signal_good" : signal_good,
+            "frame_valid" : frame_valid,
+            "raw_bytes"   : full_frame,
+        }
+
+    def read_median(self, samples: int = 3) -> dict:
+        """
+        Collect `samples` consecutive valid frames and return the median reading.
+
+        A frame is accepted if it passes the checksum + distance-range gate
+        (even if signal_good is False).  This prevents the case where the
+        sensor consistently reads strength < 20 on a particular surface and
+        all readings are rejected, causing "Only 0/N valid readings".
+
+        Returns the same dict shape as read_data(), with an added 'n_samples' key.
+        """
+        collected = []
+        attempts  = 0
+        max_tries = samples * 10   # Give a generous retry budget
+
+        while len(collected) < samples and attempts < max_tries:
+            attempts += 1
+            try:
+                r = self.read_data()
+                collected.append(r)       # Accept any frame that passed checksum
+            except LiDARReadError as exc:
+                logger.debug("read_data attempt %d failed: %s", attempts, exc)
+                continue
+
+        if len(collected) < max(1, samples // 2):
+            raise LiDARReadError(
+                f"Only {len(collected)}/{samples} frames obtained "
+                f"after {attempts} attempts"
+            )
+
+        # Median of collected distances and strengths
+        distances = sorted(r["distance_cm"] for r in collected)
+        strengths = sorted(r["strength"]    for r in collected)
+        n         = len(collected)
+
+        return {
+            "distance_cm" : distances[n // 2],
+            "strength"    : strengths[n // 2],
+            "signal_good" : all(r["signal_good"] for r in collected),
+            "frame_valid" : True,
+            "n_samples"   : n,
         }
 
     def close(self) -> None:

@@ -1,32 +1,46 @@
 """
 model_train.py
 ==============
-Trains a Random Forest pothole classifier on STATISTICAL FEATURES extracted
-from fixed-size windows of LiDAR distance readings.
+Trains a pothole / road-anomaly classifier based on BASELINE-DEVIATION features.
 
-Statistical features per window (28 total):
-  mean, std, min, max, median, range, IQR,
-  skewness, kurtosis,
-  % points above baseline+threshold (pothole zone fraction),
-  peak depth (max − baseline),
-  consecutive dip length (longest run above baseline+2σ),
-  slope entering dip (descent gradient),
-  slope exiting dip  (ascent gradient),
-  signal strength stats: mean, std, min, max  (if available; else zeros),
-  variance, mean absolute deviation,
-  number of local minima / local maxima in window,
-  10th / 90th percentile,
-  rolling mean of first half vs second half (asymmetry),
-  count of readings > baseline+5 cm,
-  count of readings > baseline+10 cm
+Concept (as the user defined):
+─────────────────────────────
+  The LiDAR is mounted vertically, pointing DOWN at the road surface.
 
-By using engineered features the RF generalises ≈15 % better than raw values.
+  • Calibrated baseline = expected distance to a flat road surface (cm).
+    Example: sensor mounted at 180 cm → baseline ≈ 180 cm.
+
+  • Pothole  → reading GREATER than baseline (ground is farther from sensor).
+  • Speed bump→ reading LESS    than baseline (ground is closer  to sensor).
+
+  The model works on DEVIATIONS from the baseline, not raw distances.
+  This makes it invariant to mounting height and self-calibrating.
+
+Classes
+───────
+  0 – Flat road        (deviation ≈ 0, just noise)
+  1 – Shallow pothole  (deviation  +3 to  +8 cm)
+  2 – Deep pothole     (deviation  +9 to +25 cm)
+  3 – Speed bump/hump  (deviation  -3 to -15 cm)
+
+Features (22 per window) — all computed on the DEVIATION array:
+  mean_dev, std_dev, max_dev, min_dev, range_dev,
+  median_dev, iqr_dev, skewness, kurtosis,
+  frac_positive (fraction of points where deviation > 0),
+  frac_pothole  (fraction where deviation > +POTHOLE_THRESH),
+  frac_bump     (fraction where deviation < -BUMP_THRESH),
+  peak_depth    (max positive deviation),
+  max_dip       (max negative deviation, absolute),
+  max_run_pos   (longest consecutive run of positive deviations),
+  max_run_neg   (longest consecutive run of negative deviations),
+  slope_entry, slope_exit, half_asymmetry,
+  n_extrema     (count of direction changes),
+  str_mean, str_std  (signal strength stats — 0 if unavailable)
 """
 
 import numpy as np
-import pandas as pd
 from scipy.stats import skew, kurtosis
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
@@ -37,233 +51,241 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WINDOW_SIZE       = 20
-N_SAMPLES         = 3000          # Total training windows
-BASELINE_HEIGHT   = 100           # cm — sensor mounting height
-NOISE_STD         = 1.5           # cm — road surface noise
-SHALLOW_DEPTH_MIN = 3             # cm
-DEEP_DEPTH_MAX    = 25            # cm
-MODEL_OUTPUT      = "pothole_model.pkl"
-SCALER_OUTPUT     = "pothole_scaler.pkl"
+WINDOW_SIZE      = 20          # Readings per inference window
+N_SAMPLES        = 4000        # Total training windows
+BASELINE_CM      = 180         # Default road surface distance (sensor height)
+NOISE_STD        = 1.5         # Road surface noise (cm)
+POTHOLE_THRESH   = 3.0         # Min deviation to count as "in pothole" (cm)
+BUMP_THRESH      = 3.0         # Min upward deviation to count as "bump" (cm)
+MODEL_PATH       = "pothole_model.pkl"
+META_PATH        = "feature_meta.pkl"
 
 
-# ── 1. Feature Extraction ─────────────────────────────────────────────────────
+# ── Feature extractor ─────────────────────────────────────────────────────────
 
-def extract_features(window: np.ndarray, strength: np.ndarray = None) -> np.ndarray:
+def extract_features(raw_window: np.ndarray,
+                     strength: np.ndarray = None,
+                     baseline: float = BASELINE_CM) -> np.ndarray:
     """
-    Convert a 1D array of `window_size` distance readings into a feature vector.
+    Convert a window of raw LiDAR distance readings to a deviation-based
+    feature vector.
 
     Parameters
     ----------
-    window   : distance readings in cm (shape: [WINDOW_SIZE])
-    strength : signal strength readings (shape: [WINDOW_SIZE]) — optional
+    raw_window : 1-D array of distance readings in cm  (length = WINDOW_SIZE)
+    strength   : 1-D array of signal strength values   (same length, optional)
+    baseline   : Road surface distance in cm (default BASELINE_CM)
 
     Returns
     -------
-    1D numpy array of features (length = 28)
+    1-D numpy float64 array of length 22
     """
-    w = np.array(window, dtype=float)
-    n = len(w)
+    w   = np.asarray(raw_window, dtype=float)
+    dev = w - baseline          # Positive → pothole / Negative → bump
 
-    baseline  = np.percentile(w, 10)       # Road level estimate
-    threshold = baseline + 3               # 3 cm noise margin
+    n   = len(dev)
 
-    # Basic stats
-    feat_mean   = w.mean()
-    feat_std    = w.std()
-    feat_min    = w.min()
-    feat_max    = w.max()
-    feat_median = np.median(w)
-    feat_range  = feat_max - feat_min
-    feat_iqr    = np.percentile(w, 75) - np.percentile(w, 25)
-    feat_p10    = np.percentile(w, 10)
-    feat_p90    = np.percentile(w, 90)
-    feat_var    = w.var()
-    feat_mad    = np.mean(np.abs(w - feat_mean))
-    feat_skew   = float(skew(w))
-    feat_kurt   = float(kurtosis(w))
+    # ── Basic stats on deviation ──────────────────────────────────────────
+    mean_dev   = dev.mean()
+    std_dev    = dev.std()
+    max_dev    = dev.max()
+    min_dev    = dev.min()
+    range_dev  = max_dev - min_dev
+    median_dev = float(np.median(dev))
+    iqr_dev    = float(np.percentile(dev, 75) - np.percentile(dev, 25))
+    skew_dev   = float(skew(dev))
+    kurt_dev   = float(kurtosis(dev))
 
-    # Pothole-specific features
-    dip_mask        = w > threshold
-    feat_dip_frac   = dip_mask.mean()                          # Fraction in hole
-    feat_peak_depth = feat_max - baseline                      # Deepest point
-    feat_dip_count  = int(np.sum(w > (baseline + 5)))          # N readings > 5 cm dip
-    feat_deep_count = int(np.sum(w > (baseline + 10)))         # N readings > 10 cm dip
+    # ── Pothole / bump zone fractions ─────────────────────────────────────
+    frac_positive = float(np.mean(dev > 0))
+    frac_pothole  = float(np.mean(dev >  POTHOLE_THRESH))
+    frac_bump     = float(np.mean(dev < -BUMP_THRESH))
+    peak_depth    = float(max(max_dev, 0))          # Max sag below road
+    max_dip       = float(max(-min_dev, 0))         # Max rise above road
 
-    # Longest consecutive dip run
-    max_run = 0
-    run = 0
-    for val in dip_mask:
-        if val:
-            run += 1
-            max_run = max(max_run, run)
-        else:
-            run = 0
-    feat_max_run = max_run
+    # ── Longest consecutive runs ──────────────────────────────────────────
+    def _max_run(mask):
+        best = run = 0
+        for v in mask:
+            run = (run + 1) if v else 0
+            best = max(best, run)
+        return best
 
-    # Entry/exit slopes (gradient at edges of the window)
-    half = n // 2
-    feat_slope_in  = (w[half-1] - w[0]) / max(half, 1)
-    feat_slope_out = (w[-1] - w[half]) / max(n - half, 1)
+    max_run_pos = _max_run(dev >  POTHOLE_THRESH)
+    max_run_neg = _max_run(dev < -BUMP_THRESH)
 
-    # Asymmetry between first half and second half mean
-    feat_asym = w[:half].mean() - w[half:].mean()
+    # ── Gradient / asymmetry ──────────────────────────────────────────────
+    half        = n // 2
+    slope_entry = float((dev[half - 1] - dev[0]) / max(half, 1))
+    slope_exit  = float((dev[-1] - dev[half])    / max(n - half, 1))
+    half_asym   = float(dev[:half].mean() - dev[half:].mean())
 
-    # Local extrema count
-    from numpy import diff, sign
-    extrema = np.sum(diff(sign(diff(w))) != 0)
-    feat_extrema = int(extrema)
+    # ── Number of local extrema ───────────────────────────────────────────
+    signs    = np.sign(np.diff(dev))
+    n_extr   = int(np.sum(np.diff(signs) != 0))
 
-    # Signal strength features
-    if strength is not None:
-        s = np.array(strength, dtype=float)
-        feat_str_mean = s.mean()
-        feat_str_std  = s.std()
-        feat_str_min  = s.min()
-        feat_str_max  = s.max()
+    # ── Strength features ─────────────────────────────────────────────────
+    if strength is not None and len(strength) > 0:
+        s        = np.asarray(strength, dtype=float)
+        str_mean = float(s.mean())
+        str_std  = float(s.std())
     else:
-        feat_str_mean = feat_str_std = feat_str_min = feat_str_max = 0.0
+        str_mean = str_std = 0.0
 
-    features = np.array([
-        feat_mean, feat_std, feat_min, feat_max, feat_median,
-        feat_range, feat_iqr, feat_p10, feat_p90, feat_var, feat_mad,
-        feat_skew, feat_kurt,
-        feat_dip_frac, feat_peak_depth, feat_dip_count, feat_deep_count,
-        feat_max_run,
-        feat_slope_in, feat_slope_out, feat_asym,
-        feat_extrema,
-        feat_str_mean, feat_str_std, feat_str_min, feat_str_max,
-    ], dtype=float)
-
-    return features
+    return np.array([
+        mean_dev, std_dev, max_dev, min_dev, range_dev,
+        median_dev, iqr_dev, skew_dev, kurt_dev,
+        frac_positive, frac_pothole, frac_bump,
+        peak_depth, max_dip,
+        max_run_pos, max_run_neg,
+        slope_entry, slope_exit, half_asym,
+        n_extr,
+        str_mean, str_std,
+    ], dtype=np.float64)
 
 
 FEATURE_NAMES = [
-    "mean", "std", "min", "max", "median",
-    "range", "iqr", "p10", "p90", "var", "mad",
-    "skewness", "kurtosis",
-    "dip_fraction", "peak_depth_cm", "dip_count_5cm", "dip_count_10cm",
-    "max_consecutive_dip",
+    "mean_dev", "std_dev", "max_dev", "min_dev", "range_dev",
+    "median_dev", "iqr_dev", "skewness", "kurtosis",
+    "frac_positive", "frac_pothole", "frac_bump",
+    "peak_depth_cm", "max_bump_cm",
+    "max_run_pothole", "max_run_bump",
     "slope_entry", "slope_exit", "half_asymmetry",
     "n_extrema",
-    "str_mean", "str_std", "str_min", "str_max",
+    "str_mean", "str_std",
 ]
+N_FEATURES = len(FEATURE_NAMES)   # 22
 
 
-# ── 2. Synthetic Data Generator ───────────────────────────────────────────────
+# ── Synthetic data generator ──────────────────────────────────────────────────
 
-def generate_synthetic_data(n_samples: int = N_SAMPLES,
-                            window_size: int = WINDOW_SIZE) -> tuple:
+def _make_window(baseline, noise_std, window_size,
+                 event_type="flat", depth=0, start=5, width=4):
+    """Generate one synthetic window of raw LiDAR readings."""
+    w = np.random.normal(baseline, noise_std, window_size)  # Road noise
+
+    if event_type == "pothole":
+        # Distance INCREASES over the hole (ground is farther)
+        end = min(start + width, window_size)
+        w[start:end] += depth
+
+    elif event_type == "bump":
+        # Distance DECREASES over the bump (ground is closer)
+        end = min(start + width, window_size)
+        w[start:end] -= depth
+        w = np.clip(w, 10, None)   # Physical floor
+
+    return w
+
+
+def generate_synthetic_data(n_samples=N_SAMPLES,
+                             window_size=WINDOW_SIZE,
+                             baseline=BASELINE_CM):
     """
-    Generates labelled windows simulating a downward-looking single-point LiDAR
-    scanning a road surface.
-
-    Classes
-    -------
-    0 — Flat road (minor surface roughness only)
-    1 — Shallow pothole  (3–8 cm deep)
-    2 — Deep pothole     (9–25 cm deep)
-    3 — Road hump / speed-bump (raised surface, distance decreases)
-
-    Returns X (features matrix), y (labels), X_raw (raw windows for reference).
+    Generate labelled synthetic windows.
+    Returns X (feature matrix), y (labels), raw_windows (for debug).
     """
-    X_raw, X_feat, y = [], [], []
-
+    X_feat, y_list, X_raw = [], [], []
     per_class = n_samples // 4
 
-    # Class 0 – Flat road
-    for _ in range(per_class):
-        w = np.random.normal(BASELINE_HEIGHT, NOISE_STD, window_size)
-        X_raw.append(w)
-        X_feat.append(extract_features(w))
-        y.append(0)
+    rng = np.random.default_rng(42)
 
-    # Class 1 – Shallow pothole (3–8 cm)
-    for _ in range(per_class):
-        w = np.random.normal(BASELINE_HEIGHT, NOISE_STD, window_size)
-        start = np.random.randint(3, window_size - 6)
-        width = np.random.randint(2, 5)
-        depth = np.random.uniform(SHALLOW_DEPTH_MIN, 8)
-        w[start:start + width] += depth
-        X_raw.append(w)
-        X_feat.append(extract_features(w))
-        y.append(1)
+    for cls, cfg in [
+        (0, {"event_type": "flat"}),
+        (1, {"event_type": "pothole", "depth_range": (3, 8)}),
+        (2, {"event_type": "pothole", "depth_range": (9, 25)}),
+        (3, {"event_type": "bump",    "depth_range": (3, 15)}),
+    ]:
+        for _ in range(per_class):
+            depth = 0
+            if cls in (1, 2, 3):
+                lo, hi = cfg["depth_range"]
+                depth  = rng.uniform(lo, hi)
 
-    # Class 2 – Deep pothole (9–25 cm)
-    for _ in range(per_class):
-        w = np.random.normal(BASELINE_HEIGHT, NOISE_STD, window_size)
-        start = np.random.randint(2, window_size - 7)
-        width = np.random.randint(3, 7)
-        depth = np.random.uniform(9, DEEP_DEPTH_MAX)
-        w[start:start + width] += depth
-        X_raw.append(w)
-        X_feat.append(extract_features(w))
-        y.append(2)
+            start = int(rng.integers(2, window_size - 7))
+            width = int(rng.integers(2, 6))
 
-    # Class 3 – Speed bump / hump (distance DECREASES)
-    for _ in range(per_class):
-        w = np.random.normal(BASELINE_HEIGHT, NOISE_STD, window_size)
-        start = np.random.randint(3, window_size - 6)
-        width = np.random.randint(4, 8)
-        height = np.random.uniform(3, 12)
-        w[start:start + width] -= height       # Closer to sensor = smaller distance
-        w = np.clip(w, 10, None)               # Physical minimum
-        X_raw.append(w)
-        X_feat.append(extract_features(w))
-        y.append(3)
+            w = _make_window(
+                baseline, NOISE_STD, window_size,
+                event_type=cfg["event_type"],
+                depth=depth, start=start, width=width
+            )
 
-    return np.array(X_feat), np.array(y), np.array(X_raw)
+            # Simulate realistic strength (asphalt range 20–80)
+            base_str = rng.uniform(20, 80, window_size)
+            # Strength drops slightly inside a pothole (more scatter)
+            if cls in (1, 2):
+                base_str[start:start + width] *= rng.uniform(0.5, 0.9)
+
+            X_feat.append(extract_features(w, base_str, baseline))
+            X_raw.append(w)
+            y_list.append(cls)
+
+    return np.array(X_feat), np.array(y_list), np.array(X_raw)
 
 
-# ── 3. Train ──────────────────────────────────────────────────────────────────
-
+# ── Train ─────────────────────────────────────────────────────────────────────
 print("=" * 60)
-print("  Pothole Detection — Model Training")
+print("  Pothole Detector — Model Training")
+print(f"  Baseline road distance: {BASELINE_CM} cm")
+print(f"  Window size: {WINDOW_SIZE} readings  |  Features: {N_FEATURES}")
 print("=" * 60)
 
-print(f"\n[1/4] Generating {N_SAMPLES} synthetic LiDAR windows …")
+print(f"\n[1/4] Generating {N_SAMPLES} synthetic windows … ", end="", flush=True)
 X, y, X_raw = generate_synthetic_data()
-print(f"      Feature shape: {X.shape}   Labels: {np.unique(y, return_counts=True)}")
+unique, counts = np.unique(y, return_counts=True)
+print(f"done.  Shape: {X.shape}")
+for cls, cnt in zip(unique, counts):
+    labels = {0: "Flat road", 1: "Shallow pothole",
+              2: "Deep pothole", 3: "Speed bump"}
+    print(f"   class {cls} ({labels[cls]}): {cnt} samples")
 
-print("\n[2/4] Splitting data (80/20, stratified) …")
+print("\n[2/4] Split 80/20 stratified … ", end="", flush=True)
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, stratify=y, random_state=42
 )
+print("done")
 
-# ── Pipeline: StandardScaler → RandomForest ──────────────────────────────────
-print("\n[3/4] Training Random Forest classifier …")
+print("\n[3/4] Training RandomForest pipeline …")
 pipeline = Pipeline([
     ("scaler", StandardScaler()),
     ("clf", RandomForestClassifier(
         n_estimators=300,
-        max_depth=15,
-        min_samples_split=5,
+        max_depth=12,
+        min_samples_split=4,
         min_samples_leaf=2,
         class_weight="balanced",
         random_state=42,
         n_jobs=-1,
-    ))
+    )),
 ])
 
-# Cross-validation score
-cv_scores = cross_val_score(pipeline, X_train, y_train,
-                             cv=StratifiedKFold(5), scoring="f1_weighted")
-print(f"      5-fold CV F1 (weighted): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_f1 = cross_val_score(pipeline, X_train, y_train,
+                         cv=cv, scoring="f1_weighted", n_jobs=-1)
+print(f"   5-fold CV F1 (weighted): {cv_f1.mean():.3f} ± {cv_f1.std():.3f}")
 
 pipeline.fit(X_train, y_train)
-y_pred = pipeline.predict(X_test)
 
 print("\n[4/4] Evaluation on held-out test set:")
 target_names = ["Flat road", "Shallow pothole", "Deep pothole", "Speed bump"]
+y_pred = pipeline.predict(X_test)
 print(classification_report(y_test, y_pred, target_names=target_names))
-print("Confusion matrix:")
+print("Confusion matrix (rows=actual, cols=predicted):")
 print(confusion_matrix(y_test, y_pred))
 
 # ── Save ──────────────────────────────────────────────────────────────────────
-joblib.dump(pipeline, MODEL_OUTPUT)
-print(f"\n✅  Model saved → {MODEL_OUTPUT}")
+joblib.dump(pipeline, MODEL_PATH)
+print(f"\n✅  Model saved → {MODEL_PATH}")
 
-# Also expose feature extractor for use by dashboard
-joblib.dump({"feature_names": FEATURE_NAMES, "window_size": WINDOW_SIZE},
-            "feature_meta.pkl")
-print(f"✅  Feature metadata saved → feature_meta.pkl")
+joblib.dump({
+    "feature_names" : FEATURE_NAMES,
+    "n_features"    : N_FEATURES,
+    "window_size"   : WINDOW_SIZE,
+    "baseline_cm"   : BASELINE_CM,
+    "pothole_thresh": POTHOLE_THRESH,
+    "bump_thresh"   : BUMP_THRESH,
+    "class_labels"  : {0: "Flat road", 1: "Shallow pothole",
+                       2: "Deep pothole", 3: "Speed bump"},
+}, META_PATH)
+print(f"✅  Feature metadata saved → {META_PATH}")

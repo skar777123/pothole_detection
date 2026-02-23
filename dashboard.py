@@ -1,22 +1,29 @@
 """
 dashboard.py
 ============
-Real-time Pothole Detection Dashboard using TF02-Pro single-point LiDAR.
+Real-time Pothole Detection Dashboard — Single-Point LiDAR (TF02-Pro)
 
-Detection pipeline
-──────────────────
-1. Read raw frame from LiDAR (with checksum + quality gating in driver)
-2. Median-filter across N_MEDIAN consecutive valid frames → reduces noise
-3. Accumulate a sliding WINDOW_SIZE buffer of confirmed distance readings
-4. Extract 26 statistical features from the window
-5. Classify with the trained RandomForest pipeline (4 classes)
-6. Apply a CONFIDENCE ACCUMULATOR: only trigger alert after
-   CONFIRM_FRAMES consecutive positive predictions (avoids single-frame FPs)
-7. Compute depth, length, width, severity from the confirmed window
-8. Log and display everything in the Streamlit UI
+Detection Concept
+─────────────────
+  The LiDAR points straight DOWN at the road.
+
+  Baseline = expected distance to flat road (default 180 cm, tunable in sidebar).
+
+  • Reading > baseline + POTHOLE_THRESH  →  ground is FARTHER → POTHOLE
+  • Reading < baseline - BUMP_THRESH     →  ground is CLOSER  → SPEED BUMP
+  • Otherwise                            →  FLAT ROAD
+
+  Each reading goes through:
+    1. LiDAR driver   : checksum + distance-range gate
+    2. Median filter  : median of N_MEDIAN consecutive frames (noise reduction)
+    3. Deviation check: compare against runtime-calibrated baseline
+    4. ML classifier  : 22-feature RandomForest (confirms the deviation)
+    5. Streak gate    : CONFIRM_FRAMES consecutive positives before alert
+    6. Dimension calc : depth, length, width from the confirmed window
 """
 
 import streamlit as st
+import pandas as pd
 import numpy as np
 import time
 import joblib
@@ -24,248 +31,309 @@ import logging
 from collections import deque
 
 from lidar_driver import TF02Pro, LiDARReadError
-from model_train import extract_features   # reuse feature extractor
+from model_train import extract_features, WINDOW_SIZE, POTHOLE_THRESH, BUMP_THRESH
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("dashboard")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-LIDAR_PORT        = '/dev/ttyUSB0'    # Change to 'COM3' on Windows
-LIDAR_BAUD        = 115200
-
-WINDOW_SIZE       = 20               # Readings per inference window
-N_MEDIAN          = 3                # Median-filter samples per reading
-SLIDE_STEP        = 1                # Overlap: advance 1 reading at a time
-
-# Confidence accumulator: require N consecutive positive frames before alerting
-CONFIRM_FRAMES    = 3
-
-VEHICLE_SPEED_KMPH = 30
-SENSOR_HEIGHT_CM   = 100            # Update to your actual mounting height (cm)
-FRAME_RATE_HZ      = 100            # TF02-Pro native frame rate
-SPEED_CM_S         = (VEHICLE_SPEED_KMPH * 1000 * 100) / 3600
-DIST_PER_READING   = SPEED_CM_S / FRAME_RATE_HZ   # cm of road per reading
-
-# Pothole severity thresholds
-SEVERITY_SHALLOW_MAX_CM = 8         # ≤ 8 cm → shallow
-SEVERITY_DEEP_MIN_CM    = 9         # ≥ 9 cm → deep
-
-# Labels returned by the model
-CLASS_LABELS = {0: "Flat Road", 1: "Shallow Pothole", 2: "Deep Pothole", 3: "Speed Bump"}
-IS_POTHOLE   = {0: False, 1: True, 2: True, 3: False}
-
-# ── Load model ────────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_model():
-    try:
-        model = joblib.load("pothole_model.pkl")
-        logger.info("Model loaded successfully.")
-        return model
-    except FileNotFoundError:
-        return None
-
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config (MUST be first Streamlit call) ────────────────────────────────
 st.set_page_config(
     layout="wide",
-    page_title="LiDAR Pothole Detection",
+    page_title="LiDAR Pothole Detector",
     page_icon="🕳️",
 )
 
-st.title("🕳️ Real-Time Pothole Detection — Single-Point LiDAR")
-st.caption(
-    "TF02-Pro · Median-filtered · ML-confirmed · Severity-graded"
-)
-
-model = load_model()
-if model is None:
-    st.error("❌ `pothole_model.pkl` not found. Run `python model_train.py` first.")
-    st.stop()
-
-# ── Metric placeholders ───────────────────────────────────────────────────────
-kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
-ph_count    = kpi_col1.empty()
-ph_depth    = kpi_col2.empty()
-ph_length   = kpi_col3.empty()
-ph_width    = kpi_col4.empty()
-ph_strength = kpi_col5.empty()
-
-st.markdown("---")
-chart_title   = st.empty()
-chart_ph      = st.empty()
-strength_ph   = st.empty()
-status_ph     = st.empty()
-log_ph        = st.empty()
-
-# ── Session state ─────────────────────────────────────────────────────────────
-defaults = {
-    "dist_history"    : deque(maxlen=300),
-    "str_history"     : deque(maxlen=300),
-    "pothole_count"   : 0,
-    "pothole_log"     : [],      # list of dicts with detection details
-    "running"         : False,
-    "confirm_streak"  : 0,       # consecutive positive-class frames
-    "last_label"      : "—",
-    "last_depth"      : 0.0,
-    "last_length"     : 0.0,
-    "last_width"      : 0.0,
-    "last_strength"   : 0,
+# ── Constants ─────────────────────────────────────────────────────────────────
+CLASS_LABELS = {
+    0: "🟢 Flat Road",
+    1: "🟡 Shallow Pothole",
+    2: "🔴 Deep Pothole",
+    3: "🔶 Speed Bump",
 }
-for k, v in defaults.items():
+IS_POTHOLE = {0: False, 1: True, 2: True, 3: False}
+
+FRAME_RATE_HZ = 100          # TF02-Pro output rate
+
+# Severity bands (depth in cm from baseline)
+SEVERITY_BANDS = [
+    (0,  3,   "None (noise)"),
+    (3,  8,   "⚠️  Shallow"),
+    (8,  15,  "🔶 Moderate"),
+    (15, 999, "🔴 Deep / Dangerous"),
+]
+
+
+# ── Model loader ──────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading pothole model …")
+def load_model():
+    try:
+        m = joblib.load("pothole_model.pkl")
+        logger.info("Model loaded from pothole_model.pkl")
+        return m
+    except FileNotFoundError:
+        return None
+
+
+# ── Session-state initialisation ──────────────────────────────────────────────
+_state_defaults = {
+    "dist_history"  : deque(maxlen=400),
+    "str_history"   : deque(maxlen=400),
+    "baseline_hist" : deque(maxlen=400),   # Running baseline for chart overlay
+    "pothole_count" : 0,
+    "bump_count"    : 0,
+    "pothole_log"   : [],
+    "running"       : False,
+    "confirm_streak": 0,
+    "last_label"    : "—",
+    "last_depth"    : 0.0,
+    "last_length"   : 0.0,
+    "last_width"    : 0.0,
+    "last_strength" : 0,
+    "calib_readings": [],    # Readings during calibration phase
+    "baseline_cm"   : 180.0, # Overwritten once calibrated
+    "calibrated"    : False,
+}
+for k, v in _state_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-# ── Pothole dimension calculator ──────────────────────────────────────────────
+# ── Sidebar configuration ─────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("⚙️ Sensor Settings")
 
-def calculate_pothole_dimensions(window: list, strength: list) -> dict:
+    lidar_port = st.text_input("Serial Port", value="/dev/ttyUSB0",
+                               help="e.g. /dev/ttyUSB0 or COM3")
+    lidar_baud = st.selectbox("Baud Rate", [115200, 9600], index=0)
+    n_median   = st.slider("Median filter (frames)", 1, 7, 3,
+                           help="Consecutive frames per reading; trades latency for noise")
+    confirm_n  = st.slider("Confirm streak", 1, 5, 3,
+                           help="Consecutive windows that must predict positive before alert")
+
+    st.markdown("---")
+    st.subheader("📏 Baseline")
+    manual_baseline = st.number_input(
+        "Default road distance (cm)", min_value=30, max_value=2000,
+        value=180, step=5,
+        help="Distance from sensor to flat road surface. "
+             "Overridden automatically during calibration.",
+    )
+    calib_n = st.slider("Calibration samples", 10, 100, 30,
+                        help="Readings averaged to compute baseline on-the-fly")
+
+    st.markdown("---")
+    st.subheader("🚗 Vehicle")
+    speed_kmph = st.number_input("Vehicle speed (km/h)", 5, 120, 30, step=5)
+
+    st.markdown("---")
+    st.subheader("📊 Classes")
+    for k, v in CLASS_LABELS.items():
+        st.markdown(f"- `{k}` → {v}")
+
+
+# ── Derived parameters ────────────────────────────────────────────────────────
+speed_cm_s      = (speed_kmph * 1000 * 100) / 3600
+dist_per_reading = speed_cm_s / FRAME_RATE_HZ   # cm of road per LiDAR reading
+
+
+# ── Helper: severity label ────────────────────────────────────────────────────
+def severity_label(depth_cm: float) -> str:
+    for lo, hi, label in SEVERITY_BANDS:
+        if lo <= depth_cm < hi:
+            return label
+    return "—"
+
+
+# ── Helper: compute pothole dimensions ───────────────────────────────────────
+def compute_dimensions(dist_buf: list, str_buf: list, baseline: float) -> dict:
     """
-    Derive depth, length, width, and severity from a confirmed pothole window.
+    Given a confirmed detection window, compute physical dimensions.
 
-    The LiDAR is mounted pointing DOWN at the road.
-    ● Road surface → reading ≈ SENSOR_HEIGHT_CM
-    ● Pothole      → reading > SENSOR_HEIGHT_CM (ground is farther away)
-
-    Parameters
-    ----------
-    window   : list of distance readings (cm) for the detection window
-    strength : corresponding signal strength readings
-
-    Returns
-    -------
-    dict with depth_cm, length_cm, width_cm, severity, avg_strength
+    depth  = max deviation above baseline  (cm)
+    length = distance travelled across     (cm, based on vehicle speed)
+    width  = estimated cross-width         (cm, geometric estimate)
     """
-    arr   = np.array(window, dtype=float)
-    s_arr = np.array(strength, dtype=float)
+    arr      = np.array(dist_buf, dtype=float)
+    dev      = arr - baseline
 
-    # Baseline = estimated road surface (10th percentile of window, robust to outliers)
-    baseline_cm = np.percentile(arr, 10)
+    # Depth = peak positive deviation (into pothole)
+    depth_cm = float(max(dev.max(), 0))
 
-    # Noise floor = 3 cm above baseline
-    noise_margin_cm = 3.0
-    dip_threshold   = baseline_cm + noise_margin_cm
+    # Length = count of points with deviation > POTHOLE_THRESH × cm per reading
+    points_in_hole = int(np.sum(dev > POTHOLE_THRESH))
+    length_cm      = round(points_in_hole * dist_per_reading, 1)
 
-    # Depth = deepest reading − baseline
-    depth_cm = float(np.max(arr) - baseline_cm)
+    # Width estimate (potholes are roughly elliptical; conservative 0.8 factor)
+    width_cm = round(length_cm * 0.80, 1)
 
-    # Length = distance travelled while readings stayed above dip_threshold
-    points_in_dip = int(np.sum(arr > dip_threshold))
-    length_cm     = points_in_dip * DIST_PER_READING
-
-    # Width = geometric estimate (assumes roughly elliptical cross-section)
-    # More conservative than a simple 1.1× factor
-    width_cm = length_cm * 0.85
-
-    # Severity
-    if depth_cm <= 0:
-        severity = "None"
-    elif depth_cm <= SEVERITY_SHALLOW_MAX_CM:
-        severity = "⚠️ Shallow"
-    elif depth_cm <= 15:
-        severity = "🔶 Moderate"
-    else:
-        severity = "🔴 Deep / Dangerous"
-
-    avg_strength = float(s_arr.mean()) if len(s_arr) > 0 else 0.0
+    avg_str = float(np.mean(str_buf)) if str_buf else 0.0
 
     return {
-        "depth_cm"    : round(depth_cm, 1),
-        "length_cm"   : round(length_cm, 1),
-        "width_cm"    : round(width_cm, 1),
-        "severity"    : severity,
-        "avg_strength": round(avg_strength, 0),
+        "depth_cm"   : round(depth_cm, 1),
+        "length_cm"  : length_cm,
+        "width_cm"   : width_cm,
+        "severity"   : severity_label(depth_cm),
+        "avg_strength": round(avg_str, 0),
     }
 
 
+# ── Simple rule-based pre-classifier (runs BEFORE ML) ────────────────────────
+def rule_classify(dist_cm: float, baseline: float) -> int | None:
+    """
+    Fast single-reading rule based on the user's baseline-deviation concept.
+
+    Returns class int or None if the reading is within the noise band.
+
+    Class 0 = flat road
+    Class 1/2 = pothole (threshold determines shallow vs deep — ML resolves this)
+    Class 3 = bump
+    """
+    dev = dist_cm - baseline
+    if dev > POTHOLE_THRESH:
+        return 1   # Possible pothole (ML will refine to 1 or 2)
+    elif dev < -BUMP_THRESH:
+        return 3   # Speed bump
+    else:
+        return 0   # Flat road
+
+
 # ── Main detection loop ───────────────────────────────────────────────────────
+def run_detection(model):
+    st.markdown("---")
+    stop_col, status_col = st.columns([1, 5])
+    stop_btn = stop_col.button("⏹ Stop", type="secondary", key="stop_btn")
 
-def run_detection():
-    """
-    Main coroutine called by the Start button.
-    Opens the LiDAR, fills a sliding window, runs inference, and updates UI.
-    """
-    stop_btn = st.button("⏹ Stop Monitoring", key="stop_btn")
-
-    dist_buffer  = []   # Distance readings buffer (raw validated)
-    str_buffer   = []   # Corresponding strength readings
-
+    # ── Open LiDAR ───────────────────────────────────────────────────────────
     try:
-        lidar = TF02Pro(port=LIDAR_PORT, baudrate=LIDAR_BAUD)
+        lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud)
     except Exception as exc:
-        st.error(f"❌ Cannot open LiDAR on `{LIDAR_PORT}`: {exc}")
-        logger.error("LiDAR open failed: %s", exc)
+        st.error(f"❌ Cannot open `{lidar_port}`: {exc}")
+        logger.error("LiDAR open error: %s", exc)
+        st.session_state.running = False
         return
 
-    st.success(f"✅ LiDAR connected on `{LIDAR_PORT}`")
-    logger.info("Detection loop started.")
+    status_col.success(f"✅ LiDAR connected → `{lidar_port}` @ {lidar_baud} baud")
 
-    consec_errors = 0
+    # ── KPI placeholders ─────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    ph_count   = k1.empty()
+    ph_bump    = k2.empty()
+    ph_depth   = k3.empty()
+    ph_length  = k4.empty()
+    ph_width   = k5.empty()
+    ph_str     = k6.empty()
+
+    st.markdown("---")
+
+    chart_header = st.empty()
+    chart_dist   = st.empty()
+    chart_str    = st.empty()
+
+    st.markdown("---")
+    status_ph = st.empty()
+    calib_ph  = st.empty()
+
+    st.markdown("---")
+    log_ph = st.empty()
+
+    # ── Buffers ───────────────────────────────────────────────────────────────
+    dist_buf = []
+    str_buf  = []
+    consec_err = 0
+
+    logger.info("Detection loop started. Baseline=%.1f cm", st.session_state.baseline_cm)
 
     while not stop_btn:
-        # ── STEP 1: Get a median-confirmed reading ────────────────────────────
+
+        # ── READ ─────────────────────────────────────────────────────────────
         try:
-            reading = lidar.read_median(samples=N_MEDIAN)
-            consec_errors = 0
+            reading   = lidar.read_median(samples=n_median)
+            consec_err = 0
         except LiDARReadError as exc:
-            consec_errors += 1
-            logger.warning("LiDAR read error (#%d): %s", consec_errors, exc)
-            if consec_errors > 20:
-                st.error("❌ Too many consecutive LiDAR errors. Check wiring.")
+            consec_err += 1
+            logger.warning("Read error #%d: %s", consec_err, exc)
+            if consec_err > 30:
+                st.error("❌ Too many consecutive read errors. Check hardware.")
                 break
             time.sleep(0.05)
             continue
 
         dist     = reading["distance_cm"]
         strength = reading["strength"]
-        temp     = reading["temperature_c"]
 
-        # ── STEP 2: Accumulate into rolling history for chart ─────────────────
+        # ── BASELINE AUTO-CALIBRATION ─────────────────────────────────────
+        if not st.session_state.calibrated:
+            st.session_state.calib_readings.append(dist)
+            remaining = calib_n - len(st.session_state.calib_readings)
+            calib_ph.info(
+                f"🔵 **Calibrating baseline** … collecting {remaining} more "
+                f"flat-road readings. Keep sensor over flat ground."
+            )
+            if len(st.session_state.calib_readings) >= calib_n:
+                # Use median of calibration readings as baseline (robust to outliers)
+                cal = sorted(st.session_state.calib_readings)
+                st.session_state.baseline_cm = float(cal[len(cal) // 2])
+                st.session_state.calibrated  = True
+                calib_ph.success(
+                    f"✅ Baseline calibrated: **{st.session_state.baseline_cm:.1f} cm**"
+                )
+                logger.info("Baseline calibrated: %.1f cm", st.session_state.baseline_cm)
+            continue   # Don't classify during calibration
+
+        baseline = st.session_state.baseline_cm
+
+        # ── UPDATE HISTORY ────────────────────────────────────────────────
         st.session_state.dist_history.append(dist)
         st.session_state.str_history.append(strength)
+        st.session_state.baseline_hist.append(baseline)
 
-        # ── STEP 3: Fill the inference window ────────────────────────────────
-        dist_buffer.append(dist)
-        str_buffer.append(strength)
+        # ── SLIDING WINDOW ────────────────────────────────────────────────
+        dist_buf.append(dist)
+        str_buf.append(strength)
+        if len(dist_buf) > WINDOW_SIZE:
+            dist_buf.pop(0)
+            str_buf.pop(0)
 
-        # Keep buffer at WINDOW_SIZE
-        if len(dist_buffer) > WINDOW_SIZE:
-            dist_buffer.pop(0)
-            str_buffer.pop(0)
+        # ── CLASSIFY (only when window is full) ───────────────────────────
+        if len(dist_buf) == WINDOW_SIZE:
+            # Step A: rule-based pre-screen on current reading only
+            rule_cls = rule_classify(dist, baseline)
 
-        # ── STEP 4: Run inference when window is full ─────────────────────────
-        if len(dist_buffer) == WINDOW_SIZE:
-            features = extract_features(
-                np.array(dist_buffer),
-                np.array(str_buffer)
+            # Step B: ML on the full window (22 deviation features)
+            feats      = extract_features(
+                np.array(dist_buf), np.array(str_buf), baseline
             ).reshape(1, -1)
+            ml_cls     = int(model.predict(feats)[0])
+            ml_proba   = model.predict_proba(feats)[0]
+            ml_conf    = float(ml_proba[ml_cls])
 
-            prediction = int(model.predict(features)[0])
-            proba      = model.predict_proba(features)[0]
-            confidence = float(proba[prediction])
-            label      = CLASS_LABELS[prediction]
+            # Agreement: use ML class if confident; use rule as tie-breaker
+            if ml_conf >= 0.60:
+                final_cls = ml_cls
+            else:
+                final_cls = rule_cls
 
-            # ── STEP 5: Confidence accumulator ───────────────────────────────
-            if IS_POTHOLE.get(prediction, False):
+            label = CLASS_LABELS[final_cls]
+            is_ph = IS_POTHOLE.get(final_cls, False)
+
+            # Step C: Streak accumulator
+            if is_ph:
                 st.session_state.confirm_streak += 1
             else:
                 st.session_state.confirm_streak = 0
 
-            confirmed_pothole = (
-                st.session_state.confirm_streak >= CONFIRM_FRAMES
-            )
+            confirmed = st.session_state.confirm_streak >= confirm_n
 
-            # ── STEP 6: On confirmed pothole, compute & log ───────────────────
-            if confirmed_pothole:
-                dims = calculate_pothole_dimensions(dist_buffer, str_buffer)
+            # ── CONFIRMED EVENT ───────────────────────────────────────────
+            if confirmed:
+                dims = compute_dimensions(dist_buf, str_buf, baseline)
                 st.session_state.pothole_count += 1
-
-                # Reset streak so we don't double-count the same hole
                 st.session_state.confirm_streak = 0
 
-                # Save last dims for KPIs
                 st.session_state.last_label    = label
                 st.session_state.last_depth    = dims["depth_cm"]
                 st.session_state.last_length   = dims["length_cm"]
@@ -273,93 +341,128 @@ def run_detection():
                 st.session_state.last_strength = int(dims["avg_strength"])
 
                 log_entry = {
-                    "time"      : time.strftime("%H:%M:%S"),
-                    "type"      : label,
-                    "depth_cm"  : dims["depth_cm"],
-                    "length_cm" : dims["length_cm"],
-                    "width_cm"  : dims["width_cm"],
-                    "severity"  : dims["severity"],
-                    "confidence": f"{confidence:.0%}",
-                    "strength"  : int(dims["avg_strength"]),
-                    "temp_c"    : temp,
+                    "Time"       : time.strftime("%H:%M:%S"),
+                    "Type"       : label,
+                    "Depth (cm)" : dims["depth_cm"],
+                    "Length (cm)": dims["length_cm"],
+                    "Width (cm)" : dims["width_cm"],
+                    "Severity"   : dims["severity"],
+                    "ML Conf."   : f"{ml_conf:.0%}",
+                    "Strength"   : int(dims["avg_strength"]),
+                    "Baseline"   : f"{baseline:.0f} cm",
                 }
                 st.session_state.pothole_log.insert(0, log_entry)
 
                 status_ph.error(
-                    f"🔴 **{label} Confirmed!** "
-                    f"Depth: {dims['depth_cm']} cm | "
-                    f"Length: {dims['length_cm']} cm | "
+                    f"🔴 **{label} CONFIRMED** — "
+                    f"Depth: **{dims['depth_cm']} cm** | "
+                    f"Length: **{dims['length_cm']} cm** | "
                     f"Severity: {dims['severity']} | "
-                    f"Confidence: {confidence:.0%}"
+                    f"Confidence: {ml_conf:.0%}"
                 )
-                logger.info("POTHOLE: %s", log_entry)
+                logger.info("DETECTED: %s", log_entry)
 
-                # Clear buffer to avoid re-triggering on same hole
-                dist_buffer.clear()
-                str_buffer.clear()
+                # Clear buffer to reset for next event
+                dist_buf.clear()
+                str_buf.clear()
 
             else:
-                # Show current classification status
-                colour = "🟢" if prediction == 0 else "🟡"
-                status_ph.info(
-                    f"{colour} **{label}** — "
-                    f"Dist: {dist} cm | Strength: {strength} | "
-                    f"Temp: {temp:.1f}°C | "
-                    f"Confidence: {confidence:.0%} | "
-                    f"Streak: {st.session_state.confirm_streak}/{CONFIRM_FRAMES}"
-                )
+                # Real-time status when no event confirmed
+                dev = dist - baseline
+                dev_str = f"+{dev:.1f}" if dev >= 0 else f"{dev:.1f}"
+                streak_bar = "█" * st.session_state.confirm_streak + \
+                             "░" * (confirm_n - st.session_state.confirm_streak)
 
-        # ── STEP 7: Update KPI metrics ────────────────────────────────────────
-        ph_count.metric("🕳️ Potholes Found",    st.session_state.pothole_count)
-        ph_depth.metric("📏 Last Depth",        f"{st.session_state.last_depth} cm")
-        ph_length.metric("↔️ Last Length",      f"{st.session_state.last_length} cm")
-        ph_width.metric("↕️ Est. Width",        f"{st.session_state.last_width} cm")
-        ph_strength.metric("📶 Last Strength",  st.session_state.last_strength)
+                if final_cls == 0:
+                    status_ph.success(
+                        f"🟢 **Flat Road** — "
+                        f"Dist: {dist} cm | Dev: {dev_str} cm | "
+                        f"Strength: {strength}"
+                    )
+                elif is_ph:
+                    status_ph.warning(
+                        f"🟡 **Possible {label}** — "
+                        f"Dist: {dist} cm | Dev: {dev_str} cm | "
+                        f"Conf: {ml_conf:.0%} | Streak: [{streak_bar}] {st.session_state.confirm_streak}/{confirm_n}"
+                    )
+                else:
+                    status_ph.info(
+                        f"🔶 **{label}** — "
+                        f"Dist: {dist} cm | Dev: {dev_str} cm | "
+                        f"Conf: {ml_conf:.0%}"
+                    )
 
-        # ── STEP 8: Update charts ─────────────────────────────────────────────
-        chart_title.markdown("### 📡 Live LiDAR Distance (cm)")
-        chart_ph.line_chart(list(st.session_state.dist_history))
-        strength_ph.line_chart(
-            {"Signal Strength": list(st.session_state.str_history)},
+        # ── UPDATE KPIs ───────────────────────────────────────────────────
+        ph_count.metric("🕳️ Potholes",  st.session_state.pothole_count)
+        ph_bump.metric("🔶 Bumps",      st.session_state.bump_count)
+        ph_depth.metric("📏 Last Depth", f"{st.session_state.last_depth} cm")
+        ph_length.metric("↔️ Length",   f"{st.session_state.last_length} cm")
+        ph_width.metric("↕️ Width",     f"{st.session_state.last_width} cm")
+        ph_str.metric("📶 Strength",    st.session_state.last_strength)
+
+        # ── UPDATE CHARTS ─────────────────────────────────────────────────
+        chart_header.markdown("### 📡 Live Distance + Baseline (cm)")
+        chart_data = pd.DataFrame({
+            "Distance (cm)" : list(st.session_state.dist_history),
+            "Baseline (cm)" : list(st.session_state.baseline_hist),
+        })
+        chart_dist.line_chart(chart_data)
+
+        chart_str.line_chart(
+            pd.DataFrame({"Signal Strength": list(st.session_state.str_history)})
         )
 
-        # ── STEP 9: Detection log table ───────────────────────────────────────
+        # ── DETECTION LOG ─────────────────────────────────────────────────
         if st.session_state.pothole_log:
-            import pandas as pd
             log_ph.subheader("📋 Detection Log")
             log_ph.dataframe(
-                pd.DataFrame(st.session_state.pothole_log).head(30),
-                use_container_width=True,
+                pd.DataFrame(st.session_state.pothole_log).head(50),
+                width="stretch",     # replaces deprecated use_container_width=True
             )
 
-        time.sleep(0.01)   # Don't hammer the CPU
+        time.sleep(0.01)
 
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     lidar.close()
+    st.session_state.running = False
     st.info("⏹ Monitoring stopped.")
     logger.info("Detection loop stopped.")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-st.sidebar.title("⚙️ Configuration")
-st.sidebar.markdown(f"""
-| Parameter | Value |
-|---|---|
-| Serial port | `{LIDAR_PORT}` |
-| Baud rate | `{LIDAR_BAUD}` |
-| Window size | `{WINDOW_SIZE}` readings |
-| Median filter | `{N_MEDIAN}` samples |
-| Confirm frames | `{CONFIRM_FRAMES}` consecutive |
-| Vehicle speed | `{VEHICLE_SPEED_KMPH}` km/h |
-| Sensor height | `{SENSOR_HEIGHT_CM}` cm |
-""")
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Model classes**")
-for k, v in CLASS_LABELS.items():
-    st.sidebar.markdown(f"- `{k}` → {v}")
+# ── UI entry point ────────────────────────────────────────────────────────────
+st.title("🕳️ Pothole Detection Dashboard — Single-Point LiDAR")
+st.caption(
+    "TF02-Pro · Baseline-Deviation Detection · ML-confirmed · Severity-graded"
+)
+
+model = load_model()
+
+if model is None:
+    st.error(
+        "❌ `pothole_model.pkl` not found.\n\n"
+        "Run `python model_train.py` to train the model first."
+    )
+    st.stop()
+
+# ── Baseline info box ─────────────────────────────────────────────────────────
+st.info(
+    f"**Detection concept:**  "
+    f"Sensor points DOWN at road. Default baseline = **{manual_baseline} cm**.  "
+    f"Distance **greater** than baseline → pothole (ground farther).  "
+    f"Distance **less** than baseline → speed bump (ground closer).  "
+    f"Baseline is **auto-calibrated** from the first {calib_n} readings."
+)
+
+# Pre-load the user's manual baseline into session state before calibration
+if not st.session_state.calibrated:
+    st.session_state.baseline_cm = float(manual_baseline)
 
 if not st.session_state.running:
-    if st.button("▶ Start Monitoring", type="primary"):
-        st.session_state.running = True
+    if st.button("▶ Start Monitoring", type="primary", use_container_width=True):
+        st.session_state.running   = True
+        st.session_state.calibrated = False
+        st.session_state.calib_readings = []
+        st.rerun()
 
 if st.session_state.running:
-    run_detection()
+    run_detection(model)
