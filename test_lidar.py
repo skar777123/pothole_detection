@@ -1,54 +1,63 @@
 """
-test_lidar.py — TF02-Pro terminal test with auto-reconnect.
+test_lidar.py — TF02-Pro hardware test. Clean version.
 Usage: python test_lidar.py [port] [baud]
 """
 import sys, time, logging
 from lidar_driver import TF02Pro, LiDARReadError
 
-PORT  = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
-BAUD  = int(sys.argv[2]) if len(sys.argv) > 2 else 115200
+PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
+BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 115200
 
-logging.basicConfig(level=logging.WARNING,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s")
 
-print(f"\n{'='*60}")
-print(f"  TF02-Pro Test  |  Port: {PORT}  |  Baud: {BAUD}")
-print(f"  Factory-reset → enable-output → 100Hz (no save)")
-print(f"{'='*60}")
-print("  Move object — distance should change immediately")
-print("  Ctrl+C to stop\n")
+print(f"\n{'='*55}")
+print(f"  TF02-Pro  |  {PORT} @ {BAUD}")
+print(f"  Smart init: reads first, only enables if silent")
+print(f"{'='*55}\n")
 
 lidar = TF02Pro(port=PORT, baudrate=BAUD, send_init=True)
-print("✅ Ready.\n")
+print("✅ Ready. Move object — watch distance change.\n")
 
 ok = 0; err = 0; consec = 0; prev = None; t0 = time.monotonic()
 
 try:
-    print(f"{'#':>5}  {'Dist':>6}  {'Δ':>6}  {'Strength':>9}  {'Temp':>6}  Hz")
-    print("-" * 55)
+    print(f"{'#':>5}  {'Dist(cm)':>9}  {'Δ':>6}  {'Strength':>9}  Temp   Hz")
+    print("-" * 58)
     while True:
         try:
             r = lidar.read_frame()
-            d = r["distance_cm"]; ok += 1; consec = 0
+            d = r["distance_cm"]
+
+            if not r.get("valid", True):
+                print(f"  ---  out of range: {d} cm", flush=True)
+                time.sleep(0.05); continue
+
+            ok += 1; consec = 0
             delta = ""
             if prev is not None and abs(d - prev) >= 1:
                 delta = f"{'↑' if d > prev else '↓'}{abs(d-prev)}"
             prev = d
             hz = ok / max(time.monotonic() - t0, 0.001)
-            print(f"{ok:>5}  {d:>6}  {delta:>6}  {r['strength']:>9}  "
-                  f"{r['temperature_c']:>6.1f}  {hz:.1f}", flush=True)
+            print(f"{ok:>5}  {d:>9}  {delta:>6}  {r['strength']:>9}"
+                  f"  {r['temperature_c']:.1f}  {hz:.1f}", flush=True)
+
         except LiDARReadError as exc:
             err += 1; consec += 1
-            print(f"  ERR [{consec}]  {str(exc)[:55]}", flush=True)
+            print(f"  ERR[{consec}] {str(exc)[:50]}", flush=True)
+
             if consec == 3:
-                print("  → Soft recovery: re-sending enable-output …", flush=True)
+                print("  → Soft: re-enabling output …", flush=True)
                 lidar._enable_output()
             elif consec >= 6:
-                print("  → Hard recovery: reconnecting port …", flush=True)
+                print("  → Hard: reconnecting port …", flush=True)
                 lidar.reconnect()
                 consec = 0
+
         time.sleep(0.05)
+
 except KeyboardInterrupt:
     e = time.monotonic() - t0
-    print(f"\n  Frames: {ok}  Errors: {err}  Rate: {ok/max(e,1):.1f}Hz")
+    print(f"\n  OK:{ok}  ERR:{err}  Err%:{err/(ok+err+1)*100:.1f}  "
+          f"Rate:{ok/max(e,1):.1f}Hz  Time:{e:.0f}s")
     lidar.close()

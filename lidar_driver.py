@@ -1,5 +1,20 @@
 """
-lidar_driver.py — TF02-Pro UART driver. Emergency stable version.
+lidar_driver.py — TF02-Pro UART driver. Clean minimal version.
+
+WHAT WENT WRONG PREVIOUSLY
+───────────────────────────
+We sent CMD_FACTORY_RESET (command 0x10) but on many TF02-Pro firmware
+versions, 0x10 is "Set Trigger Mode" not "Factory Reset". We were
+accidentally switching the sensor into trigger mode every startup,
+then wondering why it stopped streaming.
+
+CORRECT APPROACH
+─────────────────
+1. Open port
+2. Try reading first — sensor may already be streaming
+3. Only if silent after 2s: send CMD_ENABLE_OUTPUT
+4. On dropout: soft recover (re-enable), then hard recover (reconnect)
+5. NEVER send unknown commands
 """
 
 import serial
@@ -16,10 +31,12 @@ MAX_DIST_CM = 2200
 HEADER_BYTE = 0x59
 FRAME_LEN   = 9
 
-# Commands
-CMD_FACTORY_RESET  = bytes([0x5A, 0x04, 0x10, 0x6E])   # restore factory defaults
-CMD_ENABLE_OUTPUT  = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])   # enable continuous stream
-CMD_SET_100HZ      = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])  # 100Hz output
+# The ONLY safe commands (well-documented for all TF02-Pro firmware):
+CMD_ENABLE_OUTPUT = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])
+# [0x5A header][0x05 len][0x07 cmd: set-output][0x01 on][CS=0x67]
+
+CMD_SET_100HZ = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])
+# [0x5A][0x06][0x03 cmd: set-fps][0x64 0x00 = 100Hz][CS=0xC7]
 
 
 class LiDARReadError(Exception):
@@ -34,9 +51,14 @@ class TF02Pro:
         self._timeout  = timeout
         self._ser      = None
         self.connected = False
-        self._connect(send_init)
+        self._open_port()
+        if send_init:
+            self._smart_init()
 
-    def _connect(self, send_init=True):
+    # ── Port operations ───────────────────────────────────────────────────────
+
+    def _open_port(self):
+        """Open serial port cleanly."""
         if self._ser and self._ser.is_open:
             try: self._ser.close()
             except Exception: pass
@@ -49,77 +71,89 @@ class TF02Pro:
             timeout=self._timeout,
         )
         self._ser.reset_input_buffer()
-        logger.info("Opened %s @ %d baud", self.port, self.baudrate)
-        if send_init:
-            self._send_startup_commands()
-        self._ser.reset_input_buffer()
         self.connected = True
-        logger.info("TF02-Pro ready.")
+        logger.info("Port opened: %s @ %d baud", self.port, self.baudrate)
 
-    def _send_startup_commands(self):
+    def _smart_init(self):
         """
-        Factory reset → enable output → set 100Hz.
-        NO CMD_SAVE_SETTINGS — settings are temporary (runtime only).
-        This avoids corrupting the sensor's flash with bad saved state.
+        Try reading first. If sensor is already streaming, do nothing.
+        Only send CMD_ENABLE_OUTPUT if sensor is silent for 1 second.
         """
+        logger.info("Smart init: checking if sensor already streaming …")
+        # Give it 1 second to see if frames arrive on their own
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if self._ser.in_waiting >= FRAME_LEN:
+                logger.info("  → Sensor already streaming! No commands needed.")
+                self._ser.reset_input_buffer()
+                return
+            time.sleep(0.05)
+
+        # Nothing arrived — send enable output
+        logger.info("  → Sensor silent. Sending enable-output …")
+        self._send_enable()
+
+    def _send_enable(self):
+        """Send enable-output + set-100Hz. Safe, documented commands only."""
         try:
-            # Step 1: Factory reset — clears any bad saved settings
-            logger.info("  → Factory reset …")
-            self._ser.write(CMD_FACTORY_RESET); self._ser.flush()
-            time.sleep(1.5)   # sensor reboots after factory reset
-            self._ser.reset_input_buffer()
-
-            # Step 2: Enable continuous output (temporary — NOT saved)
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
-            logger.info("  → Enable output sent")
+            logger.info("  → CMD_ENABLE_OUTPUT sent")
             time.sleep(0.20)
-
-            # Step 3: Set 100Hz (temporary — NOT saved)
             self._ser.write(CMD_SET_100HZ); self._ser.flush()
-            logger.info("  → Set 100Hz sent")
+            logger.info("  → CMD_SET_100HZ sent")
             time.sleep(0.20)
-
             self._ser.reset_input_buffer()
-            logger.info("  Init complete.")
         except serial.SerialException as exc:
-            logger.warning("Init error: %s", exc)
+            logger.warning("Send error: %s", exc)
+
+    # ── Recovery ──────────────────────────────────────────────────────────────
 
     def _enable_output(self):
-        """Soft recovery: re-send enable-output."""
+        """Soft recovery: re-send enable (called after a few consecutive errors)."""
         try:
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
             time.sleep(0.20)
             self._ser.reset_input_buffer()
-            logger.info("Soft recovery done.")
+            logger.info("Soft recovery: enable-output re-sent.")
         except Exception:
             pass
 
     def reconnect(self):
-        """Hard recovery: close and fully reopen the serial port."""
-        logger.warning("Hard reconnect on %s …", self.port)
+        """
+        Hard recovery: close port, reopen, smart-init.
+        Does NOT send any reset commands — just reopen and enable.
+        """
+        logger.warning("Hard reconnect …")
         try:
-            self._connect(send_init=True)
-            logger.info("Reconnect OK.")
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+            time.sleep(0.50)
+            self._open_port()
+            self._smart_init()
+            logger.info("Reconnect done.")
         except Exception as exc:
             logger.error("Reconnect failed: %s", exc)
+
+    # ── Frame reading ─────────────────────────────────────────────────────────
 
     def _read_bytes(self, n):
         data = self._ser.read(n)
         if len(data) != n:
             raise LiDARReadError(
                 f"Expected {n} bytes, got {len(data)} "
-                f"(power glitch — check 5V supply)"
+                f"(sensor stopped — check 5V power supply)"
             )
         return data
 
     def _sync_and_read_frame(self):
+        """Scan stream for 0x59 0x59 header, read remaining 7 bytes."""
         for _ in range(FRAME_LEN * 8):
             b1 = self._read_bytes(1)
             if b1[0] != HEADER_BYTE: continue
             b2 = self._read_bytes(1)
             if b2[0] != HEADER_BYTE: continue
             return b1 + b2 + self._read_bytes(FRAME_LEN - 2)
-        raise LiDARReadError("Header 0x59 0x59 not found")
+        raise LiDARReadError("Sync header 0x59 0x59 not found in stream")
 
     @staticmethod
     def _checksum_ok(frame):
@@ -134,18 +168,23 @@ class TF02Pro:
         }
 
     def read_frame(self, _retry=0):
+        """Read one valid frame. Retries checksum failures up to 3x silently."""
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
+
         frame = self._sync_and_read_frame()
+
         if not self._checksum_ok(frame):
             if _retry < 3:
                 return self.read_frame(_retry=_retry + 1)
             raise LiDARReadError(f"Checksum fail: {frame.hex(' ')}")
+
         data = self._parse(frame)
         data["valid"] = (MIN_DIST_CM <= data["distance_cm"] <= MAX_DIST_CM)
         return data
 
     def read_frame_current(self):
+        """Read latest frame — drains stale buffer if grown too large."""
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
         if self._ser.in_waiting > FRAME_LEN * 3:
@@ -154,6 +193,7 @@ class TF02Pro:
         return self.read_frame()
 
     def diagnostic_raw_dump(self, n_bytes=90):
+        """Read raw bytes for diagnostic purposes."""
         self._ser.reset_input_buffer()
         time.sleep(0.1)
         return self._ser.read(n_bytes)
@@ -162,16 +202,23 @@ class TF02Pro:
         if self._ser and self._ser.is_open:
             self._ser.close()
             self.connected = False
+            logger.info("Port closed.")
 
     def __enter__(self): return self
     def __exit__(self, *_): self.close()
 
 
-class LiDARReaderThread:
-    """Background thread: reads at 100Hz, auto-recovers (soft then hard)."""
+# ── Background reader thread ──────────────────────────────────────────────────
 
-    SOFT_AFTER = 3    # soft recovery (re-enable) after 3 errors
-    HARD_AFTER = 6    # hard recovery (reconnect) after 6 errors
+class LiDARReaderThread:
+    """
+    Reads sensor at ~100Hz in background. Auto-recovers from dropouts.
+    Soft recovery (re-enable) after 3 errors.
+    Hard recovery (port reconnect) after 6 errors.
+    """
+
+    SOFT_AFTER = 3
+    HARD_AFTER = 6
 
     def __init__(self, lidar: TF02Pro, maxlen=5):
         self._lidar   = lidar
