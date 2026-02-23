@@ -85,7 +85,7 @@ class TF02Pro:
 
     def __init__(self, port: str = '/dev/ttyUSB0',
                  baudrate: int = 115200,
-                 timeout: float = 0.5,
+                 timeout: float = 0.05,   # 50ms — at 100Hz bytes arrive every 10ms max
                  send_init: bool = True):
         self.port      = port
         self.baudrate  = baudrate
@@ -155,7 +155,9 @@ class TF02Pro:
         if len(data) != n:
             raise LiDARReadError(
                 f"Expected {n} bytes, got {len(data)} "
-                f"(timeout — check TX wiring or run init)"
+                f"(sensor stopped mid-frame — likely a power supply issue: "
+                f"sensor TX cut out after {len(data)} byte(s). "
+                f"Check: 5V power, loose wires, USB current limit)"
             )
         return data
 
@@ -264,7 +266,9 @@ class LiDARReaderThread:
         reader.stop()
     """
 
-    AUTO_RECOVER_AFTER = 10   # re-send enable-output after this many errors
+    AUTO_RECOVER_AFTER = 3   # re-send enable-output after only 3 consecutive errors
+                               # At 50ms timeout per byte: 3 errors = ~150ms to recovery
+                               # (was 10 = up to 5 seconds of frozen waiting)
 
     def __init__(self, lidar: TF02Pro, maxlen: int = 5):
         self._lidar   = lidar

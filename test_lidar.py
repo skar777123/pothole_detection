@@ -45,7 +45,7 @@ consecutive_err = 0
 prev_dist = None
 t0 = time.monotonic()
 
-RECOVER_AFTER = 10   # re-send enable-output after this many consecutive errors
+RECOVER_AFTER = 3    # re-send enable-output after 3 consecutive errors (~150ms)
 
 try:
     print(f"{'#':>5}  {'Dist(cm)':>9}  {'Δ':>6}  {'Strength':>9}  {'Temp°C':>7}  {'Hz':>6}")
