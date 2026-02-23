@@ -318,6 +318,16 @@ def run_detection(model):
         dist     = frame["distance_cm"]
         strength = frame["strength"]
         temp     = frame["temperature_c"]
+        valid    = frame.get("valid", True)
+
+        # Skip out-of-range readings — show warning, don't affect detection
+        if not valid:
+            status_ph.warning(
+                f"⚠️ Reading out of range: **{dist} cm** "
+                f"(valid range 1–2200 cm) — skipping frame"
+            )
+            time.sleep(0.02)
+            continue
 
         # ── CALIBRATION ───────────────────────────────────────────────────────
         if not st.session_state.calibrated:
