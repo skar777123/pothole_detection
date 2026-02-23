@@ -222,17 +222,8 @@ class TF02Pro:
 
     def read_frame(self) -> dict:
         """
-        Read the next valid frame from the continuous sensor stream.
-
-        Returns
-        -------
-        dict:
-            distance_cm   : int   — distance in cm
-            strength      : int   — signal flux
-            temperature_c : float — chip temp in °C
-            valid         : bool  — True if distance in physical range
-
-        Raises LiDARReadError on timeout/checksum failure.
+        Read the next frame from the continuous serial stream.
+        No buffer management — use read_frame_current() for real-time response.
         """
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("LiDAR port is not open")
@@ -240,9 +231,7 @@ class TF02Pro:
         frame = self._sync_and_read_frame()
 
         if not self._checksum_ok(frame):
-            raise LiDARReadError(
-                f"Checksum fail  raw={frame.hex(' ')}"
-            )
+            raise LiDARReadError(f"Checksum fail  raw={frame.hex(' ')}")
 
         data  = self._parse_frame(frame)
         valid = MIN_DIST_CM <= data["distance_cm"] <= MAX_DIST_CM
@@ -258,6 +247,40 @@ class TF02Pro:
                 f"[{MIN_DIST_CM}–{MAX_DIST_CM}]"
             )
         return data
+
+    def read_frame_current(self) -> dict:
+        """
+        Read the CURRENT (freshest) frame, auto-discarding any stale backlog.
+
+        WHY THIS IS NEEDED
+        ──────────────────
+        The sensor outputs at 100 Hz (one 9-byte frame every 10 ms).
+        Streamlit UI updates take 50–150 ms per iteration, so the OS serial
+        buffer accumulates 5–15 stale frames per iteration. After 10 s of
+        running, the buffer can hold 150+ old frames, introducing 1.5 s+ lag.
+
+        HOW THIS FIX WORKS
+        ──────────────────
+        Before reading, check how many bytes are queued in the OS buffer.
+        If > FRAME_LEN * 3 bytes (3+ frames worth), the data is stale —
+        flush and wait 12 ms for the sensor to emit one fresh frame.
+        If buffer is small (fresh), just read normally with no overhead.
+        """
+        if not self.connected or not self._ser.is_open:
+            raise LiDARReadError("LiDAR port is not open")
+
+        # Auto-drain: if more than 3 frames queued, buffer is stale
+        stale_threshold = FRAME_LEN * 3   # 27 bytes = 3 frames
+        queued = self._ser.in_waiting
+        if queued > stale_threshold:
+            logger.debug(
+                "Draining %d stale bytes (%d frames behind)",
+                queued, queued // FRAME_LEN
+            )
+            self._ser.reset_input_buffer()
+            time.sleep(0.012)   # 12ms > one frame period (10ms) at 100Hz
+
+        return self.read_frame()
 
     def read_median(self, samples: int = 3) -> dict:
         """Read `samples` frames and return the one with the median distance."""

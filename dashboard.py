@@ -41,7 +41,11 @@ CLASS_LABELS = {0: "🟢 Flat Road", 1: "🟡 Shallow Pothole",
                 2: "🔴 Deep Pothole",  3: "🔶 Speed Bump"}
 IS_POTHOLE   = {0: False, 1: True,  2: True,  3: False}
 IS_BUMP      = {0: False, 1: False, 2: False, 3: True}
-FRAME_RATE_HZ = 100
+FRAME_RATE_HZ       = 100
+DETECTION_COOLDOWN_S = 3.0   # Seconds between allowed consecutive detections
+                               # Prevents repeat-fire while object is held still.
+                               # At 30 km/h a vehicle travels 25 m in 3 s — plenty.
+DEEP_THRESH_CM      = 8.0    # Deviation above this → Deep Pothole (class 2)
 SEVERITY_BANDS = [
     (0,   3,   "— Noise"),
     (3,   8,   "⚠️ Shallow"),
@@ -61,24 +65,25 @@ def load_model():
 
 # ── Session state ─────────────────────────────────────────────────────────────
 _defaults: dict = {
-    "dist_history"  : deque(maxlen=500),
-    "dev_history"   : deque(maxlen=500),
-    "str_history"   : deque(maxlen=500),
-    "baseline_hist" : deque(maxlen=500),
-    "pothole_count" : 0,
-    "bump_count"    : 0,
-    "pothole_log"   : [],
-    "running"       : False,
-    "confirm_streak": 0,
-    "last_label"    : "—",
-    "last_depth"    : 0.0,
-    "calib_readings": [],
-    "baseline_cm"   : float(DEFAULT_BASELINE),
-    "calibrated"    : False,
-    "dist_buf"      : [],
-    "str_buf"       : [],
-    "total_frames"  : 0,
-    "total_errors"  : 0,
+    "dist_history"      : deque(maxlen=500),
+    "dev_history"       : deque(maxlen=500),
+    "str_history"       : deque(maxlen=500),
+    "baseline_hist"     : deque(maxlen=500),
+    "pothole_count"     : 0,
+    "bump_count"        : 0,
+    "pothole_log"       : [],
+    "running"           : False,
+    "confirm_streak"    : 0,
+    "last_label"        : "—",
+    "last_depth"        : 0.0,
+    "calib_readings"    : [],
+    "baseline_cm"       : float(DEFAULT_BASELINE),
+    "calibrated"        : False,
+    "dist_buf"          : [],
+    "str_buf"           : [],
+    "total_frames"      : 0,
+    "total_errors"      : 0,
+    "last_detection_t"  : 0.0,   # monotonic time of last confirmed detection
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -123,11 +128,21 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🔍 Detection")
-    pot_thresh  = st.number_input("Pothole threshold (cm)", 1.0, 30.0,
-                                  value=float(POTHOLE_THRESH), step=0.5)
+    pot_thresh  = st.number_input("Shallow pothole threshold (cm)", 1.0, 30.0,
+                                  value=float(POTHOLE_THRESH), step=0.5,
+                                  help="Deviation above baseline = shallow pothole start")
+    deep_thresh = st.number_input("Deep pothole threshold (cm)", 1.0, 50.0,
+                                  value=float(DEEP_THRESH_CM), step=0.5,
+                                  help="Deviation above this = Deep Pothole (class 2)")
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
                                   value=float(BUMP_THRESH), step=0.5)
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
+    cooldown_s  = st.number_input(
+        "Detection cooldown (s)", 0.5, 30.0,
+        value=DETECTION_COOLDOWN_S, step=0.5,
+        help="Minimum seconds between consecutive detections. "
+             "Prevents repeat-fire when sensor stays over same anomaly."
+    )
 
     st.markdown("---")
     st.subheader("🚗 Vehicle Speed")
@@ -170,10 +185,19 @@ def compute_dimensions(dist_buf, str_buf, baseline) -> dict:
 
 
 def rule_classify(dist_cm, baseline) -> int:
+    """
+    Instant single-reading rule classification.
+    Returns:
+      0 = Flat road
+      1 = Shallow pothole   (+pot_thresh  to +deep_thresh cm deviation)
+      2 = Deep pothole      (> +deep_thresh cm deviation)
+      3 = Speed bump        (< -bump_thresh cm deviation)
+    """
     dev = dist_cm - baseline
-    if dev >  pot_thresh:  return 1
-    if dev < -bump_thresh: return 3
-    return 0
+    if dev > deep_thresh:  return 2   # deep pothole ← FIX: was always returning 1
+    if dev > pot_thresh:   return 1   # shallow pothole
+    if dev < -bump_thresh: return 3   # speed bump
+    return 0                          # flat road
 
 
 # ── DIAGNOSTIC PANEL ─────────────────────────────────────────────────────────
@@ -325,10 +349,13 @@ def run_detection(model):
     log_ph = st.empty()
 
     # Local buffer refs
-    dist_buf = st.session_state.dist_buf
-    str_buf  = st.session_state.str_buf
-    consec_err = 0
-    last_chart = 0.0
+    dist_buf     = st.session_state.dist_buf
+    str_buf      = st.session_state.str_buf
+    consec_err   = 0
+    last_ui_t    = 0.0   # last time ALL Streamlit UI was updated
+    UI_HZ        = 10    # target UI refresh rate (Hz)
+    UI_INTERVAL  = 1.0 / UI_HZ   # 100 ms between UI updates
+    # Detection alerts bypass the throttle and fire immediately
 
     if bypass_calib and not st.session_state.calibrated:
         st.session_state.baseline_cm = float(manual_baseline)
@@ -340,9 +367,9 @@ def run_detection(model):
     # ── Main loop ─────────────────────────────────────────────────────────────
     while not stop_btn:
 
-        # READ FRAME
+        # READ FRESHEST FRAME (auto-drains stale OS-buffer backlog)
         try:
-            frame = lidar.read_frame()
+            frame = lidar.read_frame_current()
             consec_err = 0
             st.session_state.total_frames += 1
         except LiDARReadError as exc:
@@ -445,37 +472,58 @@ def run_detection(model):
             st.session_state.confirm_streak = 0
 
         if st.session_state.confirm_streak >= confirm_n:
-            dims = compute_dimensions(dist_buf, str_buf, baseline)
-            if is_ph:
-                st.session_state.pothole_count += 1
-            elif is_bump:
-                st.session_state.bump_count += 1
+            # ── COOLDOWN GATE ───────────────────────────────────────────────────
+            # If a detection was just logged recently, skip this one.
+            # Prevents repeat-fire when sensor is held still over an anomaly
+            # (real potholes last < 0.5 s at driving speeds).
+            now_t   = time.monotonic()
+            elapsed = now_t - st.session_state.last_detection_t
+            in_cooldown = elapsed < cooldown_s
 
-            st.session_state.confirm_streak = 0
-            half = len(dist_buf) // 2
-            dist_buf[:] = dist_buf[half:]
-            str_buf[:]  = str_buf[half:]
-            st.session_state.last_depth = dims["depth_cm"]
+            if in_cooldown:
+                # Still in cooldown: show countdown but don’t log again
+                remaining = cooldown_s - elapsed
+                status_ph.warning(
+                    f"🟡 **{CLASS_LABELS[final_cls]}** (cooldown ⏳ {remaining:.1f}s) — "
+                    f"dev: **{dev:+.1f} cm** | same anomaly, not re-logged"
+                )
+                st.session_state.confirm_streak = 0
+            else:
+                # ── CONFIRMED NEW DETECTION ───────────────────────────
+                dims = compute_dimensions(dist_buf, str_buf, baseline)
+                if is_ph:
+                    st.session_state.pothole_count += 1
+                elif is_bump:
+                    st.session_state.bump_count += 1
 
-            log_entry = {
-                "Time"       : time.strftime("%H:%M:%S"),
-                "Type"       : CLASS_LABELS[final_cls],
-                "Dev (cm)"   : f"{dev:+.1f}",
-                "Depth (cm)" : dims["depth_cm"],
-                "Length (cm)": dims["length_cm"],
-                "Width (cm)" : dims["width_cm"],
-                "Severity"   : dims["severity"],
-                "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
-                "Strength"   : int(dims["avg_strength"]),
-                "Baseline"   : f"{baseline:.0f}",
-            }
-            st.session_state.pothole_log.insert(0, log_entry)
+                st.session_state.confirm_streak   = 0
+                st.session_state.last_detection_t = now_t
+                st.session_state.last_depth       = dims["depth_cm"]
+                half = len(dist_buf) // 2
+                dist_buf[:] = dist_buf[half:]
+                str_buf[:]  = str_buf[half:]
 
-            status_ph.error(
-                f"🔴 **{CLASS_LABELS[final_cls]}** — "
-                f"dev: **{dev:+.1f} cm** | depth: **{dims['depth_cm']} cm** | "
-                f"length: {dims['length_cm']} cm | {dims['severity']}"
-            )
+                log_entry = {
+                    "Time"       : time.strftime("%H:%M:%S"),
+                    "Type"       : CLASS_LABELS[final_cls],
+                    "Dev (cm)"   : f"{dev:+.1f}",
+                    "Depth (cm)" : dims["depth_cm"],
+                    "Length (cm)": dims["length_cm"],
+                    "Width (cm)" : dims["width_cm"],
+                    "Severity"   : dims["severity"],
+                    "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
+                    "Strength"   : int(dims["avg_strength"]),
+                    "Baseline"   : f"{baseline:.0f}",
+                }
+                st.session_state.pothole_log.insert(0, log_entry)
+
+                status_ph.error(
+                    f"🔴 **{CLASS_LABELS[final_cls]} CONFIRMED** — "
+                    f"dev: **{dev:+.1f} cm** | depth: **{dims['depth_cm']} cm** | "
+                    f"length: {dims['length_cm']} cm | {dims['severity']} | "
+                    f"cooldown: {cooldown_s:.0f}s"
+                )
+                logger.info("DETECTED: %s", log_entry)
         else:
             sb  = "█" * st.session_state.confirm_streak + "░" * max(0, confirm_n - st.session_state.confirm_streak)
             dev_s = f"{dev:+.1f}"
@@ -495,20 +543,28 @@ def run_detection(model):
                     f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm**"
                 )
 
-        # KPIs
-        ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
-        ph_dist.metric("📡 Distance",    f"{dist} cm")
-        ph_dev.metric("↕️ Deviation",    f"{dev:+.1f} cm",
-                      delta=f"{dev:+.1f}", delta_color="inverse")
-        ph_str.metric("📶 Strength",     strength)
-        ph_temp.metric("🌡️ Temp",        f"{temp}°C")
-        ph_count.metric("🕳️ Potholes",  st.session_state.pothole_count)
-        ph_bump.metric("🔶 Bumps",       st.session_state.bump_count)
-        ph_depth.metric("📏 Last Depth", f"{st.session_state.last_depth} cm")
-
-        # Charts (throttled to 10 Hz)
+        # ── THROTTLED UI UPDATE (all Streamlit renders at 10 Hz max) ──────────
+        # Detection ALERTS above this block fire immediately (no throttle).
+        # KPIs, charts, stats, log are updated at most every 100ms.
+        # This keeps the detection loop running fast (≥ 50 Hz) so the OS
+        # buffer stays small and distances update almost instantaneously.
         now = time.monotonic()
-        if now - last_chart >= 0.10:
+        queued_bytes = lidar._ser.in_waiting if lidar._ser.is_open else 0
+        queued_frames = queued_bytes // FRAME_LEN
+
+        if now - last_ui_t >= UI_INTERVAL:
+            # KPIs
+            ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
+            ph_dist.metric("📡 Distance",    f"{dist} cm")
+            ph_dev.metric("↕️ Deviation",    f"{dev:+.1f} cm",
+                          delta=f"{dev:+.1f}", delta_color="inverse")
+            ph_str.metric("📶 Strength",     strength)
+            ph_temp.metric("🌡️ Temp",        f"{temp}°C")
+            ph_count.metric("🕳️ Potholes",  st.session_state.pothole_count)
+            ph_bump.metric("🔶 Bumps",       st.session_state.bump_count)
+            ph_depth.metric("📏 Last Depth", f"{st.session_state.last_depth} cm")
+
+            # Charts
             chart_dist.line_chart(pd.DataFrame({
                 "Distance (cm)": list(st.session_state.dist_history),
                 "Baseline (cm)": list(st.session_state.baseline_hist),
@@ -519,23 +575,27 @@ def run_detection(model):
             chart_str.line_chart(pd.DataFrame({
                 "Signal Strength": list(st.session_state.str_history),
             }))
-            last_chart = now
 
-        # Frame stats
-        t  = st.session_state.total_frames
-        e  = st.session_state.total_errors
-        stats_ph.caption(
-            f"Frames: **{t}** | Errors: **{e}** ({e/max(t,1)*100:.1f}%) | "
-            f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
-            f"Streak: {st.session_state.confirm_streak}/{confirm_n}"
-        )
-
-        if st.session_state.pothole_log:
-            log_ph.subheader("📋 Detection Log")
-            log_ph.dataframe(
-                pd.DataFrame(st.session_state.pothole_log).head(50),
-                width="stretch",
+            # Frame stats (shows if buffer is accumulating lag)
+            t = st.session_state.total_frames
+            e = st.session_state.total_errors
+            lag_warn = f" ⚠️ **{queued_frames} frames behind**" if queued_frames > 5 else ""
+            stats_ph.caption(
+                f"Frames: **{t}** | Errors: **{e}** ({e/max(t,1)*100:.1f}%) | "
+                f"Buffer: {queued_bytes} B ({queued_frames} frames){lag_warn} | "
+                f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
+                f"Streak: {st.session_state.confirm_streak}/{confirm_n}"
             )
+
+            # Detection log
+            if st.session_state.pothole_log:
+                log_ph.subheader("📋 Detection Log")
+                log_ph.dataframe(
+                    pd.DataFrame(st.session_state.pothole_log).head(50),
+                    width="stretch",
+                )
+
+            last_ui_t = now
 
     lidar.close()
     st.session_state.running = False
