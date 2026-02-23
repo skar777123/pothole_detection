@@ -3,8 +3,22 @@ lidar_driver.py
 ================
 TF02-Pro single-point LiDAR driver.
 
-Includes LiDARReaderThread — a background thread that reads sensor frames
-continuously at 100 Hz so the main (UI) thread never blocks on serial I/O.
+ROOT CAUSE OF "WORKS 40 FRAMES THEN STOPS"
+────────────────────────────────────────────
+  The soft-reset command (0x5A 0x04 0x02 0x60) tells the sensor to reboot
+  and reload its SAVED settings. If the sensor's factory-saved config has
+  continuous output = OFF (trigger mode), the sensor goes silent after the
+  reset finishes. We then send CMD_ENABLE_OUTPUT which temporarily enables
+  streaming, but that setting is not saved, so the next internal config
+  load reverts it.
+
+  Fix:
+    1. Never send soft-reset.
+    2. Send CMD_ENABLE_OUTPUT + CMD_SAVE_SETTINGS so the sensor persists
+       continuous-output mode across power cycles.
+    3. Auto-recover: if N consecutive timeouts occur mid-session, re-send
+       CMD_ENABLE_OUTPUT (sensor may have been power-glitched).
+    4. Swallow isolated checksum failures and re-sync inline.
 
 TF02-Pro 9-byte UART frame (115200 baud, 100 Hz):
   [0] 0x59  header
@@ -33,10 +47,22 @@ MAX_DIST_CM = 2200
 HEADER_BYTE = 0x59
 FRAME_LEN   = 9       # bytes per frame
 
-# ── Startup commands (host → sensor)  CS = LSB(sum of all preceding bytes) ───
-CMD_SOFT_RESET    = bytes([0x5A, 0x04, 0x02, 0x60])
+# ── Host → Sensor commands ────────────────────────────────────────────────────
+# CS = LSB( sum of all bytes in the command except CS itself )
+
+# ⚠️  NO SOFT-RESET here on purpose.
+#     Soft-reset reloads saved settings which may be "trigger mode".
+
 CMD_ENABLE_OUTPUT = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])
-CMD_SET_100HZ     = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])
+# [0x5A] header | [0x05] len | [0x07] set-output-mode | [0x01] ON
+# CS = (0x5A+0x05+0x07+0x01) & 0xFF = 103 = 0x67 ✓
+
+CMD_SAVE_SETTINGS = bytes([0x5A, 0x04, 0x11, 0x6F])
+# [0x5A] header | [0x04] len | [0x11] save | CS = 0x6F ✓
+# After this the sensor ALWAYS boots in continuous-output mode.
+
+CMD_SET_100HZ = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])
+# [0x5A] | [0x06] | [0x03] set-fps | [0x64 0x00] = 100 Hz | CS = 0xC7 ✓
 
 BAUD_CANDIDATES = [115200, 9600]
 
@@ -54,7 +80,7 @@ class TF02Pro:
     port       : e.g. '/dev/ttyUSB0' or 'COM3'
     baudrate   : 115200 (factory default)
     timeout    : per-byte read timeout in seconds
-    send_init  : send soft-reset + enable-output commands at startup
+    send_init  : send enable-output + save-settings commands at startup
     """
 
     def __init__(self, port: str = '/dev/ttyUSB0',
@@ -70,59 +96,74 @@ class TF02Pro:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _open(self, timeout: float, send_init: bool) -> None:
-        try:
-            self._ser = serial.Serial(
-                self.port, self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=timeout,
-            )
-            self._ser.reset_input_buffer()
-            logger.info("Opened %s @ %d baud", self.port, self.baudrate)
+        self._ser = serial.Serial(
+            self.port, self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout,
+        )
+        self._ser.reset_input_buffer()
+        logger.info("Opened %s @ %d baud", self.port, self.baudrate)
 
-            if send_init:
-                self._send_startup_commands()
+        if send_init:
+            self._send_startup_commands()
 
-            self._ser.reset_input_buffer()
-            self.connected = True
-            logger.info("TF02-Pro ready on %s", self.port)
-
-        except serial.SerialException as exc:
-            logger.error("Cannot open %s: %s", self.port, exc)
-            raise
+        self._ser.reset_input_buffer()
+        self.connected = True
+        logger.info("TF02-Pro ready on %s", self.port)
 
     def _send_startup_commands(self) -> None:
-        logger.info("Sending init commands …")
+        """
+        Send enable-output + save-settings so sensor stays in streaming mode.
+        NO soft-reset — that would reload saved (possibly trigger-mode) settings.
+        """
+        logger.info("Sending init commands (NO soft-reset) …")
         try:
-            self._ser.write(CMD_SOFT_RESET);   self._ser.flush()
-            logger.info("  → Soft reset sent")
-            time.sleep(1.0)
-            self._ser.reset_input_buffer()
-
+            # 1. Enable continuous output
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
-            logger.info("  → Enable output sent")
-            time.sleep(0.1)
+            logger.info("  → Enable output sent (5A 05 07 01 67)")
+            time.sleep(0.15)
 
-            self._ser.write(CMD_SET_100HZ);    self._ser.flush()
-            logger.info("  → Set 100Hz sent")
-            time.sleep(0.1)
+            # 2. Set 100 Hz
+            self._ser.write(CMD_SET_100HZ); self._ser.flush()
+            logger.info("  → Set 100Hz sent (5A 06 03 64 00 C7)")
+            time.sleep(0.15)
 
-            logger.info("Init complete. Sensor streaming …")
+            # 3. SAVE settings — now this survives power cycles
+            self._ser.write(CMD_SAVE_SETTINGS); self._ser.flush()
+            logger.info("  → Save settings sent (5A 04 11 6F)")
+            time.sleep(0.15)
+
+            self._ser.reset_input_buffer()   # flush ACK responses
+            logger.info("  Init complete — continuous output is now SAVED.")
         except serial.SerialException as exc:
             logger.warning("Init command error: %s", exc)
+
+    def _enable_output(self) -> None:
+        """Re-send enable-output mid-session (auto-recover)."""
+        try:
+            self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
+            logger.info("Re-sent enable-output (auto-recover).")
+            time.sleep(0.15)
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
 
     def _read_bytes(self, n: int) -> bytes:
         data = self._ser.read(n)
         if len(data) != n:
             raise LiDARReadError(
                 f"Expected {n} bytes, got {len(data)} "
-                f"(timeout — sensor TX disconnected or in trigger mode?)"
+                f"(timeout — check TX wiring or run init)"
             )
         return data
 
     def _sync_and_read_frame(self) -> bytes:
-        """Scan stream for 0x59 0x59 header, then read remaining 7 bytes."""
+        """
+        Scan stream for 0x59 0x59 header then read next 7 bytes.
+        Searches up to FRAME_LEN*6 bytes before giving up.
+        """
         for _ in range(FRAME_LEN * 6):
             b1 = self._read_bytes(1)
             if b1[0] != HEADER_BYTE:
@@ -131,7 +172,7 @@ class TF02Pro:
             if b2[0] != HEADER_BYTE:
                 continue
             return b1 + b2 + self._read_bytes(FRAME_LEN - 2)
-        raise LiDARReadError("Header 0x59 0x59 not found in stream")
+        raise LiDARReadError("Header 0x59 0x59 not found within search window")
 
     @staticmethod
     def _checksum_ok(frame: bytes) -> bool:
@@ -147,22 +188,29 @@ class TF02Pro:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def read_frame(self) -> dict:
+    def read_frame(self, _retry: int = 0) -> dict:
         """
-        Read one frame from the continuous stream (no buffer management).
-        For real-time use, prefer LiDARReaderThread.get_latest() instead.
+        Read one valid frame from the continuous stream.
+
+        Bad checksum frames (from 1-byte misalignment) are automatically
+        retried up to 3 times before raising LiDARReadError.
         """
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
 
         frame = self._sync_and_read_frame()
+
         if not self._checksum_ok(frame):
-            raise LiDARReadError(f"Checksum fail: {frame.hex(' ')}")
+            if _retry < 3:
+                # Misalignment by 1 byte is common — just re-sync silently
+                logger.debug("Checksum fail (retry %d): %s", _retry, frame.hex(' '))
+                return self.read_frame(_retry=_retry + 1)
+            raise LiDARReadError(f"Checksum fail after 3 retries: {frame.hex(' ')}")
 
         data = self._parse(frame)
         if not (MIN_DIST_CM <= data["distance_cm"] <= MAX_DIST_CM):
             raise LiDARReadError(
-                f"Distance {data['distance_cm']} cm out of range "
+                f"Distance {data['distance_cm']} cm outside valid range "
                 f"[{MIN_DIST_CM}–{MAX_DIST_CM}]"
             )
         data["valid"] = True
@@ -170,22 +218,22 @@ class TF02Pro:
 
     def read_frame_current(self) -> dict:
         """
-        Read the freshest frame, draining stale buffer if it has grown.
-        Useful when calling from a single-threaded loop.
+        Read the freshest frame — drains stale OS buffer if grown too large.
+        Use this from a slow loop (e.g. every 50ms) to avoid reading stale data.
         """
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
 
         queued = self._ser.in_waiting
-        if queued > FRAME_LEN * 3:   # > 3 frames queued → data is stale
-            logger.debug("Draining %d stale bytes", queued)
+        if queued > FRAME_LEN * 3:
+            logger.debug("Draining %d stale bytes (%d frames)", queued, queued // FRAME_LEN)
             self._ser.reset_input_buffer()
-            time.sleep(0.012)        # wait ~1.2 frame periods for fresh data
+            time.sleep(0.012)   # ~1.2× frame period at 100Hz
 
         return self.read_frame()
 
     def diagnostic_raw_dump(self, n_bytes: int = 90) -> bytes:
-        """Read raw bytes without parsing (for wiring/baud diagnostics)."""
+        """Read raw bytes without parsing (for wiring/baud-rate diagnostics)."""
         self._ser.reset_input_buffer()
         time.sleep(0.1)
         return self._ser.read(n_bytes)
@@ -206,62 +254,62 @@ class LiDARReaderThread:
     """
     Reads TF02-Pro frames continuously in a background daemon thread.
 
-    WHY THIS EXISTS
-    ───────────────
-    Streamlit UI updates (metrics, charts) take 50-150 ms each. During that
-    time the sensor emits 5-15 frames into the OS serial buffer. When the
-    main thread finally calls read_frame() it gets the oldest buffered frame,
-    not the current one — creating visible lag.
-
-    With LiDARReaderThread:
-    • Background thread reads the sensor at 100 Hz continuously.
-    • It always drains the serial buffer instantly.
-    • Main (UI) thread calls get_latest() — zero serial I/O, zero lag.
-    • Distance updates reflect the CURRENT reading, not what it was 2s ago.
+    The thread auto-recovers from consecutive timeouts by re-sending the
+    enable-output command (handles sensor power glitches mid-session).
 
     Usage
     -----
-        reader = LiDARReaderThread(lidar, maxlen=5)
-        ...
-        frame = reader.get_latest()   # always the freshest reading
-        ...
+        reader = LiDARReaderThread(lidar)
+        frame  = reader.get_latest()    # always the freshest reading
         reader.stop()
     """
 
+    AUTO_RECOVER_AFTER = 10   # re-send enable-output after this many errors
+
     def __init__(self, lidar: TF02Pro, maxlen: int = 5):
-        self._lidar    = lidar
-        self._buf      = deque(maxlen=maxlen)   # ring buffer of recent frames
-        self._lock     = threading.Lock()
-        self._running  = True
-        self.errors    = 0
-        self.frames    = 0
-        self._thread   = threading.Thread(
+        self._lidar   = lidar
+        self._buf     = deque(maxlen=maxlen)
+        self._lock    = threading.Lock()
+        self._running = True
+        self.errors   = 0
+        self.frames   = 0
+        self._consec  = 0     # consecutive error counter for auto-recover
+        self._thread  = threading.Thread(
             target=self._loop, daemon=True, name="LiDARReader"
         )
         self._thread.start()
         logger.info("LiDARReaderThread started (maxlen=%d)", maxlen)
 
     def _loop(self) -> None:
-        """Background loop: read frame → store in ring buffer, repeat."""
         while self._running:
             try:
-                frame = self._lidar.read_frame()   # blocks ~10ms at 100Hz
+                frame = self._lidar.read_frame()
                 with self._lock:
                     self._buf.append(frame)
-                self.frames += 1
+                self.frames  += 1
+                self._consec  = 0   # reset on success
+
             except LiDARReadError as exc:
-                self.errors += 1
-                logger.debug("Reader thread error: %s", exc)
-                time.sleep(0.005)   # brief pause before retry
+                self.errors  += 1
+                self._consec += 1
+                logger.debug("Reader error #%d: %s", self._consec, exc)
+
+                if self._consec >= self.AUTO_RECOVER_AFTER:
+                    logger.warning(
+                        "%d consecutive errors — re-sending enable-output …",
+                        self._consec,
+                    )
+                    self._lidar._enable_output()
+                    self._consec = 0
+
+                time.sleep(0.005)
+
             except Exception as exc:
-                logger.error("Unexpected error in reader thread: %s", exc)
+                logger.error("Unexpected reader thread error: %s", exc)
                 time.sleep(0.05)
 
     def get_latest(self) -> dict | None:
-        """
-        Return the most recently received frame, or None if none yet.
-        Thread-safe. Zero serial I/O — just returns from the ring buffer.
-        """
+        """Return most-recent frame from ring buffer. Thread-safe, zero serial I/O."""
         with self._lock:
             return self._buf[-1] if self._buf else None
 
