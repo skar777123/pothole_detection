@@ -1,22 +1,8 @@
 """
 dashboard.py
 =============
-Real-time Pothole Detection — TF02-Pro Single-Point LiDAR
-Continuous streaming mode: reads every frame the sensor emits (~100 Hz).
-
-DETECTION PIPELINE
-──────────────────
-  Every frame from the sensor:
-    1. Parse distance, strength, temperature
-    2. Compare to baseline:
-         deviation = distance - baseline
-         > +pot_thresh cm  → POTHOLE  (ground dropped / farther)
-         < -bump_thresh cm → BUMP     (ground rose / closer)
-         else              → FLAT ROAD
-    3. Build a 20-reading sliding window
-    4. ML classifier on the window (22 features)
-    5. Streak gate: N consecutive positive windows → confirmed alert
-    6. Compute depth, length, width, severity → log entry
+Real-time Pothole Detection — TF02-Pro LiDAR
+Includes hardware diagnostic panel to debug "sensor not sending data" issues.
 """
 
 import streamlit as st
@@ -27,7 +13,7 @@ import joblib
 import logging
 from collections import deque
 
-from lidar_driver import TF02Pro, LiDARReadError
+from lidar_driver import TF02Pro, LiDARReadError, list_ports
 from model_train import (
     extract_features,
     WINDOW_SIZE,
@@ -51,16 +37,11 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CLASS_LABELS = {
-    0: "🟢 Flat Road",
-    1: "🟡 Shallow Pothole",
-    2: "🔴 Deep Pothole",
-    3: "🔶 Speed Bump",
-}
-IS_POTHOLE = {0: False, 1: True, 2: True, 3: False}
-IS_BUMP    = {0: False, 1: False, 2: False, 3: True}
+CLASS_LABELS = {0: "🟢 Flat Road", 1: "🟡 Shallow Pothole",
+                2: "🔴 Deep Pothole",  3: "🔶 Speed Bump"}
+IS_POTHOLE   = {0: False, 1: True,  2: True,  3: False}
+IS_BUMP      = {0: False, 1: False, 2: False, 3: True}
 FRAME_RATE_HZ = 100
-
 SEVERITY_BANDS = [
     (0,   3,   "— Noise"),
     (3,   8,   "⚠️ Shallow"),
@@ -78,7 +59,7 @@ def load_model():
         return None
 
 
-# ── Session-state defaults ────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 _defaults: dict = {
     "dist_history"  : deque(maxlen=500),
     "dev_history"   : deque(maxlen=500),
@@ -91,16 +72,13 @@ _defaults: dict = {
     "confirm_streak": 0,
     "last_label"    : "—",
     "last_depth"    : 0.0,
-    "last_length"   : 0.0,
-    "last_width"    : 0.0,
-    "last_strength" : 0,
     "calib_readings": [],
     "baseline_cm"   : float(DEFAULT_BASELINE),
     "calibrated"    : False,
     "dist_buf"      : [],
     "str_buf"       : [],
-    "total_frames"  : 0,     # total frames received from sensor
-    "total_errors"  : 0,     # total failed frames
+    "total_frames"  : 0,
+    "total_errors"  : 0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -111,44 +89,45 @@ for k, v in _defaults.items():
 with st.sidebar:
     st.title("⚙️ Settings")
 
+    # Auto-detect available ports
+    available_ports = list_ports()
+    default_port = "/dev/ttyUSB0"
+
     lidar_port = st.text_input(
-        "Serial Port", value="/dev/ttyUSB0",
-        help="Linux: /dev/ttyUSB0  |  Windows: COM3"
+        "Serial Port",
+        value=default_port,
+        help="Linux: /dev/ttyUSB0  |  Windows: COM3, COM4 …",
     )
-    lidar_baud = st.selectbox("Baud Rate", [115200, 9600], index=0)
+    if available_ports:
+        st.caption(f"Detected ports: `{'`, `'.join(available_ports)}`")
+    else:
+        st.caption("⚠️ No serial ports detected on this machine")
+
+    lidar_baud = st.selectbox("Baud Rate", [115200, 9600, 19200, 56000], index=0)
+
+    send_init = st.checkbox(
+        "Send startup commands to sensor",
+        value=True,
+        help="Sends soft-reset + enable-output + 100Hz commands on connect. "
+             "Fixes 'sensor not sending data' when sensor is in trigger mode.",
+    )
 
     st.markdown("---")
     st.subheader("📏 Baseline")
     manual_baseline = st.number_input(
-        "Road distance (cm)", min_value=10, max_value=2000,
+        "Road distance (cm)", 10, 2000,
         value=int(st.session_state.baseline_cm), step=5,
-        help="Sensor height above flat road. Auto-calibrated on startup.",
     )
-    calib_n = st.slider(
-        "Calibration samples", 5, 60, 20,
-        help="Readings collected over flat road to set baseline"
-    )
-    bypass_calib = st.checkbox(
-        "Skip calibration (use manual value above)",
-        value=False,
-    )
+    calib_n = st.slider("Calibration samples", 5, 60, 20)
+    bypass_calib = st.checkbox("Skip calibration (use manual baseline)", value=False)
 
     st.markdown("---")
-    st.subheader("🔍 Detection Thresholds")
-    pot_thresh = st.number_input(
-        "Pothole threshold (cm)", 1.0, 30.0,
-        value=float(POTHOLE_THRESH), step=0.5,
-        help="Deviation ABOVE baseline to consider a reading as inside pothole"
-    )
-    bump_thresh = st.number_input(
-        "Bump threshold (cm)", 1.0, 30.0,
-        value=float(BUMP_THRESH), step=0.5,
-        help="Deviation BELOW baseline to consider a reading as speed bump"
-    )
-    confirm_n = st.slider(
-        "Confirm streak (windows)", 1, 4, 2,
-        help="Consecutive windows that must agree before firing an alert"
-    )
+    st.subheader("🔍 Detection")
+    pot_thresh  = st.number_input("Pothole threshold (cm)", 1.0, 30.0,
+                                  value=float(POTHOLE_THRESH), step=0.5)
+    bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
+                                  value=float(BUMP_THRESH), step=0.5)
+    confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
 
     st.markdown("---")
     st.subheader("🚗 Vehicle Speed")
@@ -161,9 +140,9 @@ with st.sidebar:
         st.rerun()
 
 
-# ── Derived values ────────────────────────────────────────────────────────────
+# ── Derived ───────────────────────────────────────────────────────────────────
 speed_cm_s       = (speed_kmph * 100_000) / 3600
-dist_per_reading = speed_cm_s / FRAME_RATE_HZ   # cm of road per frame
+dist_per_reading = speed_cm_s / FRAME_RATE_HZ
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -175,103 +154,193 @@ def severity_label(depth_cm: float) -> str:
     return "—"
 
 
-def compute_dimensions(dist_buf: list, str_buf: list, baseline: float) -> dict:
-    arr          = np.array(dist_buf, dtype=float)
-    dev          = arr - baseline
-    depth_cm     = float(max(dev.max(), 0))
-    pts_in_hole  = int(np.sum(dev > pot_thresh))
-    length_cm    = round(pts_in_hole * dist_per_reading, 1)
-    width_cm     = round(length_cm * 0.80, 1)
-    avg_str      = float(np.mean(str_buf)) if str_buf else 0.0
+def compute_dimensions(dist_buf, str_buf, baseline) -> dict:
+    arr         = np.array(dist_buf, dtype=float)
+    dev         = arr - baseline
+    depth_cm    = float(max(dev.max(), 0))
+    in_hole     = int(np.sum(dev > pot_thresh))
+    length_cm   = round(in_hole * dist_per_reading, 1)
     return {
         "depth_cm"    : round(depth_cm, 1),
         "length_cm"   : length_cm,
-        "width_cm"    : width_cm,
+        "width_cm"    : round(length_cm * 0.8, 1),
         "severity"    : severity_label(depth_cm),
-        "avg_strength": round(avg_str, 0),
+        "avg_strength": round(float(np.mean(str_buf)) if str_buf else 0, 0),
     }
 
 
-def rule_classify(dist_cm: float, baseline: float) -> int:
+def rule_classify(dist_cm, baseline) -> int:
     dev = dist_cm - baseline
-    if dev > pot_thresh:
-        return 1    # pothole
-    if dev < -bump_thresh:
-        return 3    # speed bump
-    return 0        # flat road
+    if dev >  pot_thresh:  return 1
+    if dev < -bump_thresh: return 3
+    return 0
 
 
-# ── Main detection loop ───────────────────────────────────────────────────────
+# ── DIAGNOSTIC PANEL ─────────────────────────────────────────────────────────
+
+def show_diagnostic():
+    st.subheader("🔬 Hardware Diagnostic")
+    st.markdown("""
+Use this panel to verify the LiDAR sensor is **physically sending data** before starting detection.
+It opens the port, reads raw bytes (no parsing), and shows you what the sensor is actually transmitting.
+""")
+
+    st.markdown("""
+**Common causes of "Expected 1 bytes, got 0":**
+| Cause | What you see | Fix |
+|---|---|---|
+| Sensor in **Trigger mode** | 0 bytes in diagnostic | Enable **"Send startup commands"** in sidebar |
+| **TX wire not connected** | 0 bytes in diagnostic | Check wiring: Sensor TX → UART Adapter RX |
+| **Wrong baud rate** | Garbled bytes (not `59 59`) | Try 9600 or auto-scan |
+| **Sensor output disabled** | 0 bytes in diagnostic | Enable **"Send startup commands"** in sidebar |
+| Adapter **RX/TX swapped** | 0 bytes in diagnostic | Swap TX↔RX wires |
+""")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if st.button("🔍 Raw Byte Diagnostic", type="primary"):
+            try:
+                with st.spinner(f"Opening {lidar_port} and reading raw bytes …"):
+                    lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
+                                    timeout=0.5, send_init=send_init)
+                    raw = lidar.diagnostic_raw_dump(n_bytes=90)
+                    lidar.close()
+
+                if not raw:
+                    st.error(
+                        f"❌ **Received 0 bytes** from `{lidar_port}` at {lidar_baud} baud.\n\n"
+                        "**The sensor IS NOT sending any data.**\n\n"
+                        "**Most likely cause:** TX wire from sensor not reaching UART adapter RX.\n\n"
+                        "**Check these:**\n"
+                        "1. Enable **'Send startup commands'** in the sidebar (toggles sensor output mode)\n"
+                        "2. Verify **Sensor TX → Adapter RX** wiring\n"
+                        "3. Try baud rate **9600** instead of 115200\n"
+                        "4. Try a different USB port or adapter"
+                    )
+                else:
+                    hex_str   = raw.hex(' ')
+                    has_hdr   = b'\x59\x59' in raw
+                    n_frames  = hex_str.count('59 59')
+
+                    if has_hdr:
+                        st.success(
+                            f"✅ **Received {len(raw)} bytes** — "
+                            f"found `59 59` header **{n_frames} time(s)**. "
+                            f"Sensor is streaming correctly!"
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ **Received {len(raw)} bytes** but NO `59 59` header found.\n\n"
+                            f"This means the sensor IS connected but baud rate is likely wrong.\n"
+                            f"**Try baud rate 9600.**"
+                        )
+
+                    st.markdown("**Raw bytes (hex):**")
+                    # Show in 9-byte groups (one frame per line)
+                    groups = [raw[i:i+9] for i in range(0, len(raw), 9)]
+                    lines  = []
+                    for i, g in enumerate(groups):
+                        h = g.hex(' ')
+                        ok = (len(g) == 9 and g[0] == 0x59 and g[1] == 0x59
+                              and (sum(g[:8]) & 0xFF) == g[8])
+                        dist = (g[2] | g[3] << 8) if len(g) >= 4 else None
+                        tag = f"← VALID frame, dist={dist} cm" if ok and dist else ""
+                        lines.append(f"[{i:02d}] {h:<27} {tag}")
+                    st.code('\n'.join(lines), language="")
+
+            except Exception as exc:
+                st.error(f"❌ Could not open port: **{exc}**")
+                if available_ports:
+                    st.info(f"Available ports: `{'`, `'.join(available_ports)}`")
+
+    with c2:
+        if st.button("📡 Test Single Reading"):
+            try:
+                with st.spinner("Reading one frame …"):
+                    lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
+                                    timeout=0.5, send_init=send_init)
+                    r = lidar.read_frame()
+                    lidar.close()
+
+                st.success("✅ **Frame received!**")
+                st.json({
+                    "distance_cm"  : r["distance_cm"],
+                    "strength"     : r["strength"],
+                    "temperature_c": r["temperature_c"],
+                    "valid"        : r["valid"],
+                })
+            except LiDARReadError as exc:
+                st.error(f"❌ Read failed: {exc}")
+            except Exception as exc:
+                st.error(f"❌ Port error: {exc}")
+
+    with c3:
+        if st.button("🔁 Rescan Serial Ports"):
+            st.rerun()
+
+
+# ── Detection loop ────────────────────────────────────────────────────────────
 
 def run_detection(model):
-
-    # ── Open LiDAR ───────────────────────────────────────────────────────────
     try:
-        lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud)
+        lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
+                        timeout=0.5, send_init=send_init)
     except Exception as exc:
-        st.error(f"❌ Cannot open `{lidar_port}`: {exc}")
+        st.error(
+            f"❌ Cannot open `{lidar_port}`: {exc}\n\n"
+            f"**Available ports:** `{'`, `'.join(available_ports) or 'none detected'}`\n\n"
+            "Use the **Hardware Diagnostic** below to troubleshoot."
+        )
         st.session_state.running = False
+        show_diagnostic()
         return
 
-    # ── UI shell (created once, updated in-place every frame) ────────────────
+    # ── Layout ───────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
-    hdr_l.success(f"✅ Streaming from `{lidar_port}` @ {lidar_baud} baud")
-    stop_btn = hdr_r.button("⏹ Stop", key="stop_btn")
+    hdr_l.success(
+        f"✅ Streaming from `{lidar_port}` @ {lidar_baud} baud  "
+        f"| Init commands: {'✓ sent' if send_init else '✗ skipped'}"
+    )
+    stop_btn = hdr_r.button("⏹ Stop")
 
-    # KPI row
     kc = st.columns(8)
-    ph_base   = kc[0].empty()
-    ph_dist   = kc[1].empty()
-    ph_dev    = kc[2].empty()
-    ph_str    = kc[3].empty()
-    ph_temp   = kc[4].empty()
-    ph_count  = kc[5].empty()
-    ph_bump   = kc[6].empty()
-    ph_depth  = kc[7].empty()
+    ph_base  = kc[0].empty(); ph_dist  = kc[1].empty()
+    ph_dev   = kc[2].empty(); ph_str   = kc[3].empty()
+    ph_temp  = kc[4].empty(); ph_count = kc[5].empty()
+    ph_bump  = kc[6].empty(); ph_depth = kc[7].empty()
 
     st.markdown("---")
+    status_ph = st.empty()
+    calib_ph  = st.empty()
 
-    # Status banner
-    status_ph  = st.empty()
-    calib_ph   = st.empty()
-
-    # Charts
-    st.markdown("### 📡 Continuous LiDAR Stream")
-    ch1, ch2 = st.columns(2)
-    chart_dist = ch1.empty()
-    chart_dev  = ch2.empty()
+    st.markdown("### 📡 Live Stream")
+    ca, cb = st.columns(2)
+    chart_dist = ca.empty()
+    chart_dev  = cb.empty()
     chart_str  = st.empty()
-
-    # Frame stats bar
-    stats_ph = st.empty()
+    stats_ph   = st.empty()
 
     st.markdown("---")
     log_ph = st.empty()
 
-    # ── Local shorthand references to session-state buffers ───────────────────
+    # Local buffer refs
     dist_buf = st.session_state.dist_buf
     str_buf  = st.session_state.str_buf
+    consec_err = 0
+    last_chart = 0.0
 
-    # ── Apply bypass calibration if requested ─────────────────────────────────
     if bypass_calib and not st.session_state.calibrated:
         st.session_state.baseline_cm = float(manual_baseline)
         st.session_state.calibrated  = True
-        calib_ph.success(
-            f"✅ Manual baseline: **{st.session_state.baseline_cm:.0f} cm**"
-        )
+        calib_ph.success(f"✅ Manual baseline: **{manual_baseline} cm**")
 
-    logger.info("Streaming started. Baseline=%.1f cm",
-                st.session_state.baseline_cm)
+    logger.info("Streaming started. init_commands=%s", send_init)
 
-    consec_err = 0
-    last_chart_update = 0.0   # throttle chart redraws
-
-    # ====================================================================
-    # CONTINUOUS LOOP — one iteration = one sensor frame (~10 ms at 100Hz)
-    # ====================================================================
+    # ── Main loop ─────────────────────────────────────────────────────────────
     while not stop_btn:
 
-        # ─── READ ONE FRAME from the live stream ──────────────────────────
+        # READ FRAME
         try:
             frame = lidar.read_frame()
             consec_err = 0
@@ -280,39 +349,44 @@ def run_detection(model):
             consec_err += 1
             st.session_state.total_errors += 1
             logger.warning("Frame error #%d: %s", consec_err, exc)
-            if consec_err > 30:
+
+            if consec_err == 5:
+                status_ph.warning(
+                    f"⚠️ **{consec_err} consecutive read errors.**  \n"
+                    f"Last error: `{exc}`  \n\n"
+                    f"**If this continues:**  \n"
+                    f"1. Stop monitoring  \n"
+                    f"2. Run the **Hardware Diagnostic** panel below  \n"
+                    f"3. Make sure **'Send startup commands'** is enabled in the sidebar"
+                )
+            elif consec_err >= 30:
                 st.error(
-                    "❌ Too many consecutive errors.\n\n"
-                    "**Check:** correct port? LiDAR powered? Baud rate correct?"
+                    "❌ **Too many consecutive errors — stopping.**\n\n"
+                    "The sensor is not sending data. "
+                    "Open the **Hardware Diagnostic** panel to investigate."
                 )
                 break
-            # Don't sleep long — just retry immediately
             continue
 
         dist     = frame["distance_cm"]
         strength = frame["strength"]
         temp     = frame["temperature_c"]
 
-        # ─── CALIBRATION PHASE ────────────────────────────────────────────
+        # CALIBRATION
         if not st.session_state.calibrated:
             st.session_state.calib_readings.append(dist)
-            done      = len(st.session_state.calib_readings)
-            remaining = calib_n - done
+            done = len(st.session_state.calib_readings)
 
             calib_ph.info(
-                f"🔵 **Calibrating** {done}/{calib_n} — "
-                f"dist: **{dist} cm** | str: {strength} | temp: {temp}°C | "
-                f"{remaining} more readings needed over flat ground."
+                f"🔵 **Calibrating …** {done}/{calib_n} — "
+                f"dist: **{dist} cm** | str: {strength} | temp: {temp}°C — "
+                f"Keep sensor over flat ground."
             )
 
             st.session_state.dist_history.append(dist)
-            st.session_state.dev_history.append(
-                dist - st.session_state.baseline_cm
-            )
+            st.session_state.dev_history.append(dist - st.session_state.baseline_cm)
             st.session_state.str_history.append(strength)
-            st.session_state.baseline_hist.append(
-                st.session_state.baseline_cm
-            )
+            st.session_state.baseline_hist.append(st.session_state.baseline_cm)
 
             if done >= calib_n:
                 cal = sorted(st.session_state.calib_readings)
@@ -322,39 +396,33 @@ def run_detection(model):
                     f"✅ Baseline locked: **{st.session_state.baseline_cm:.1f} cm** "
                     f"(median of {done} readings)"
                 )
-                logger.info("Baseline: %.1f cm", st.session_state.baseline_cm)
 
-            # Update KPIs during calibration
-            ph_base.metric("📐 Baseline",  f"{st.session_state.baseline_cm:.0f} cm")
-            ph_dist.metric("📡 Distance",  f"{dist} cm")
+            ph_base.metric("📐 Baseline", f"{st.session_state.baseline_cm:.0f} cm")
+            ph_dist.metric("📡 Distance", f"{dist} cm")
             ph_dev.metric("↕️ Deviation",
                           f"{dist - st.session_state.baseline_cm:+.1f} cm")
-            ph_str.metric("📶 Strength",   strength)
-            ph_temp.metric("🌡️ Temp",      f"{temp}°C")
+            ph_str.metric("📶 Strength", strength)
+            ph_temp.metric("🌡️ Temp", f"{temp}°C")
             ph_count.metric("🕳️ Potholes", st.session_state.pothole_count)
             ph_bump.metric("🔶 Bumps",     st.session_state.bump_count)
-            ph_depth.metric("📏 Last Depth",
-                            f"{st.session_state.last_depth} cm")
-            continue   # skip detection during calibration
+            ph_depth.metric("📏 Last Depth", f"{st.session_state.last_depth} cm")
+            continue
 
-        # ─── ACTIVE DETECTION ─────────────────────────────────────────────
+        # ACTIVE DETECTION
         baseline = st.session_state.baseline_cm
         dev      = dist - baseline
 
-        # Update live histories
         st.session_state.dist_history.append(dist)
         st.session_state.dev_history.append(dev)
         st.session_state.str_history.append(strength)
         st.session_state.baseline_hist.append(baseline)
 
-        # Sliding inference window
         dist_buf.append(dist)
         str_buf.append(strength)
         if len(dist_buf) > WINDOW_SIZE:
             dist_buf.pop(0)
             str_buf.pop(0)
 
-        # ─── CLASSIFY ─────────────────────────────────────────────────────
         rule_cls = rule_classify(dist, baseline)
 
         if len(dist_buf) == WINDOW_SIZE and model is not None:
@@ -362,8 +430,7 @@ def run_detection(model):
                 np.array(dist_buf), np.array(str_buf), baseline
             ).reshape(1, -1)
             ml_cls  = int(model.predict(feats)[0])
-            ml_prob = model.predict_proba(feats)[0]
-            ml_conf = float(ml_prob[ml_cls])
+            ml_conf = float(model.predict_proba(feats)[0][ml_cls])
             final_cls = ml_cls if ml_conf >= 0.55 else rule_cls
         else:
             final_cls = rule_cls
@@ -372,90 +439,63 @@ def run_detection(model):
         is_ph   = IS_POTHOLE.get(final_cls, False)
         is_bump = IS_BUMP.get(final_cls, False)
 
-        # Streak gate
         if is_ph or is_bump:
             st.session_state.confirm_streak += 1
         else:
             st.session_state.confirm_streak = 0
 
-        confirmed = st.session_state.confirm_streak >= confirm_n
-
-        # ─── CONFIRMED DETECTION ──────────────────────────────────────────
-        if confirmed:
+        if st.session_state.confirm_streak >= confirm_n:
             dims = compute_dimensions(dist_buf, str_buf, baseline)
-
             if is_ph:
                 st.session_state.pothole_count += 1
             elif is_bump:
                 st.session_state.bump_count += 1
 
             st.session_state.confirm_streak = 0
-            # Slide buffer by half (don't fully clear)
             half = len(dist_buf) // 2
             dist_buf[:] = dist_buf[half:]
             str_buf[:]  = str_buf[half:]
-
-            st.session_state.last_label    = CLASS_LABELS[final_cls]
-            st.session_state.last_depth    = dims["depth_cm"]
-            st.session_state.last_length   = dims["length_cm"]
-            st.session_state.last_width    = dims["width_cm"]
-            st.session_state.last_strength = int(dims["avg_strength"])
+            st.session_state.last_depth = dims["depth_cm"]
 
             log_entry = {
-                "Time"        : time.strftime("%H:%M:%S"),
-                "Type"        : CLASS_LABELS[final_cls],
-                "Dev (cm)"    : f"{dev:+.1f}",
-                "Depth (cm)"  : dims["depth_cm"],
-                "Length (cm)" : dims["length_cm"],
-                "Width (cm)"  : dims["width_cm"],
-                "Severity"    : dims["severity"],
-                "ML Conf."    : f"{ml_conf:.0%}" if ml_conf > 0 else "rule",
-                "Strength"    : int(dims["avg_strength"]),
-                "Temp (°C)"   : temp,
-                "Baseline"    : f"{baseline:.0f} cm",
+                "Time"       : time.strftime("%H:%M:%S"),
+                "Type"       : CLASS_LABELS[final_cls],
+                "Dev (cm)"   : f"{dev:+.1f}",
+                "Depth (cm)" : dims["depth_cm"],
+                "Length (cm)": dims["length_cm"],
+                "Width (cm)" : dims["width_cm"],
+                "Severity"   : dims["severity"],
+                "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
+                "Strength"   : int(dims["avg_strength"]),
+                "Baseline"   : f"{baseline:.0f}",
             }
             st.session_state.pothole_log.insert(0, log_entry)
 
             status_ph.error(
-                f"🔴 **{CLASS_LABELS[final_cls]} CONFIRMED** — "
-                f"Deviation: **{dev:+.1f} cm** | "
-                f"Depth: **{dims['depth_cm']} cm** | "
-                f"Length: {dims['length_cm']} cm | "
-                f"Width: {dims['width_cm']} cm | "
-                f"{dims['severity']}"
+                f"🔴 **{CLASS_LABELS[final_cls]}** — "
+                f"dev: **{dev:+.1f} cm** | depth: **{dims['depth_cm']} cm** | "
+                f"length: {dims['length_cm']} cm | {dims['severity']}"
             )
-            logger.info("DETECTED: %s", log_entry)
-
         else:
-            # Live status
-            streak_bar = (
-                "█" * st.session_state.confirm_streak
-                + "░" * max(0, confirm_n - st.session_state.confirm_streak)
-            )
-            win_pct = f"{len(dist_buf)}/{WINDOW_SIZE}"
-            dev_s   = f"{dev:+.1f}"
-
+            sb  = "█" * st.session_state.confirm_streak + "░" * max(0, confirm_n - st.session_state.confirm_streak)
+            dev_s = f"{dev:+.1f}"
             if final_cls == 0:
                 status_ph.success(
-                    f"🟢 **Flat Road** — "
-                    f"dist: **{dist} cm** | dev: {dev_s} cm | "
-                    f"str: {strength} | temp: {temp}°C | win: {win_pct}"
+                    f"🟢 Flat Road — dist: **{dist} cm** | dev: {dev_s} cm | "
+                    f"str: {strength} | temp: {temp}°C"
                 )
             elif is_ph:
                 status_ph.warning(
-                    f"🟡 **{CLASS_LABELS[final_cls]}** — "
-                    f"dist: **{dist} cm** | dev: **{dev_s} cm** | "
-                    f"conf: {ml_conf:.0%} | streak [{streak_bar}] "
+                    f"🟡 {CLASS_LABELS[final_cls]} — dist: **{dist} cm** | "
+                    f"dev: **{dev_s} cm** | streak [{sb}] "
                     f"{st.session_state.confirm_streak}/{confirm_n}"
                 )
             else:
                 status_ph.info(
-                    f"🔶 **Speed Bump** — "
-                    f"dist: **{dist} cm** | dev: **{dev_s} cm** | "
-                    f"conf: {ml_conf:.0%}"
+                    f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm**"
                 )
 
-        # ─── KPIs (every frame) ───────────────────────────────────────────
+        # KPIs
         ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
         ph_dist.metric("📡 Distance",    f"{dist} cm")
         ph_dev.metric("↕️ Deviation",    f"{dev:+.1f} cm",
@@ -466,32 +506,30 @@ def run_detection(model):
         ph_bump.metric("🔶 Bumps",       st.session_state.bump_count)
         ph_depth.metric("📏 Last Depth", f"{st.session_state.last_depth} cm")
 
-        # ─── Charts (throttled — Streamlit re-render is ~30ms overhead) ──
+        # Charts (throttled to 10 Hz)
         now = time.monotonic()
-        if now - last_chart_update >= 0.10:   # update charts at ~10 Hz
+        if now - last_chart >= 0.10:
             chart_dist.line_chart(pd.DataFrame({
                 "Distance (cm)": list(st.session_state.dist_history),
                 "Baseline (cm)": list(st.session_state.baseline_hist),
             }))
             chart_dev.line_chart(pd.DataFrame({
-                "Deviation (cm)": list(st.session_state.dev_history)
+                "Deviation (cm)": list(st.session_state.dev_history),
             }))
             chart_str.line_chart(pd.DataFrame({
-                "Signal Strength": list(st.session_state.str_history)
+                "Signal Strength": list(st.session_state.str_history),
             }))
-            last_chart_update = now
+            last_chart = now
 
-        # ─── Frame stats ──────────────────────────────────────────────────
-        total = st.session_state.total_frames
-        errs  = st.session_state.total_errors
-        err_pct = (errs / max(total, 1)) * 100
+        # Frame stats
+        t  = st.session_state.total_frames
+        e  = st.session_state.total_errors
         stats_ph.caption(
-            f"Frames received: **{total}** | "
-            f"Errors: **{errs}** ({err_pct:.1f}%) | "
-            f"Window: {len(dist_buf)}/{WINDOW_SIZE}"
+            f"Frames: **{t}** | Errors: **{e}** ({e/max(t,1)*100:.1f}%) | "
+            f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
+            f"Streak: {st.session_state.confirm_streak}/{confirm_n}"
         )
 
-        # ─── Detection log ────────────────────────────────────────────────
         if st.session_state.pothole_log:
             log_ph.subheader("📋 Detection Log")
             log_ph.dataframe(
@@ -499,49 +537,35 @@ def run_detection(model):
                 width="stretch",
             )
 
-        # NO time.sleep here — read next frame immediately for max throughput
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
     lidar.close()
     st.session_state.running = False
-    st.info("⏹ Streaming stopped.")
-    logger.info("Stopped. Frames=%d Errors=%d",
-                st.session_state.total_frames,
-                st.session_state.total_errors)
+    st.info("⏹ Stopped.")
 
 
 # ── Page entry point ──────────────────────────────────────────────────────────
-st.title("🕳️ Pothole Detection — Continuous LiDAR Stream")
-st.caption(
-    "TF02-Pro · 100 Hz continuous stream · Baseline-deviation · ML-confirmed"
-)
+st.title("🕳️ Pothole Detection — TF02-Pro LiDAR")
+st.caption("Continuous stream · Startup init commands · Hardware diagnostics")
 
 model = load_model()
 if model is None:
-    st.warning(
-        "⚠️ `pothole_model.pkl` not found — **rule-only mode**.  "
-        "Train the model: `python model_train.py`"
-    )
+    st.warning("⚠️ `pothole_model.pkl` not found — rule-only mode. "
+               "Run `python model_train.py` to enable ML.")
 
 if not st.session_state.calibrated:
     st.session_state.baseline_cm = float(manual_baseline)
 
-st.info(
-    f"**How it works:** LiDAR shoots **down** at road.  "
-    f"Baseline = **{st.session_state.baseline_cm:.0f} cm**.  \n"
-    f"📈 dist − baseline > **+{pot_thresh} cm** → **POTHOLE** (ground dropped).  \n"
-    f"📉 dist − baseline < **−{bump_thresh} cm** → **BUMP** (ground rose)."
-)
-
 if not st.session_state.running:
     c1, c2 = st.columns([2, 5])
     with c1:
-        if st.button("▶ Start Streaming", type="primary"):
+        if st.button("▶ Start Monitoring", type="primary"):
             st.session_state.running        = True
             if not bypass_calib:
                 st.session_state.calibrated     = False
                 st.session_state.calib_readings = []
             st.rerun()
+
+    st.markdown("---")
+    show_diagnostic()
 
 if st.session_state.running:
     run_detection(model)
