@@ -1,5 +1,5 @@
 """
-lidar_driver.py — TF02-Pro UART driver with auto-reconnect recovery.
+lidar_driver.py — TF02-Pro UART driver. Emergency stable version.
 """
 
 import serial
@@ -11,14 +11,15 @@ from collections import deque
 
 logger = logging.getLogger(__name__)
 
-MIN_DIST_CM  = 1      # allow readings down to 1 cm (was 5 — caused ERR at close range)
-MAX_DIST_CM  = 2200
-HEADER_BYTE  = 0x59
-FRAME_LEN    = 9
+MIN_DIST_CM = 1
+MAX_DIST_CM = 2200
+HEADER_BYTE = 0x59
+FRAME_LEN   = 9
 
-CMD_ENABLE_OUTPUT = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])
-CMD_SAVE_SETTINGS = bytes([0x5A, 0x04, 0x11, 0x6F])
-CMD_SET_100HZ     = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])
+# Commands
+CMD_FACTORY_RESET  = bytes([0x5A, 0x04, 0x10, 0x6E])   # restore factory defaults
+CMD_ENABLE_OUTPUT  = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])   # enable continuous stream
+CMD_SET_100HZ      = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])  # 100Hz output
 
 
 class LiDARReadError(Exception):
@@ -36,7 +37,6 @@ class TF02Pro:
         self._connect(send_init)
 
     def _connect(self, send_init=True):
-        """Open (or re-open) the serial port and optionally send init commands."""
         if self._ser and self._ser.is_open:
             try: self._ser.close()
             except Exception: pass
@@ -50,45 +50,56 @@ class TF02Pro:
         )
         self._ser.reset_input_buffer()
         logger.info("Opened %s @ %d baud", self.port, self.baudrate)
-
         if send_init:
             self._send_startup_commands()
-
         self._ser.reset_input_buffer()
         self.connected = True
         logger.info("TF02-Pro ready.")
 
     def _send_startup_commands(self):
+        """
+        Factory reset → enable output → set 100Hz.
+        NO CMD_SAVE_SETTINGS — settings are temporary (runtime only).
+        This avoids corrupting the sensor's flash with bad saved state.
+        """
         try:
+            # Step 1: Factory reset — clears any bad saved settings
+            logger.info("  → Factory reset …")
+            self._ser.write(CMD_FACTORY_RESET); self._ser.flush()
+            time.sleep(1.5)   # sensor reboots after factory reset
+            self._ser.reset_input_buffer()
+
+            # Step 2: Enable continuous output (temporary — NOT saved)
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
             logger.info("  → Enable output sent")
-            time.sleep(0.15)
+            time.sleep(0.20)
+
+            # Step 3: Set 100Hz (temporary — NOT saved)
             self._ser.write(CMD_SET_100HZ); self._ser.flush()
             logger.info("  → Set 100Hz sent")
-            time.sleep(0.15)
-            self._ser.write(CMD_SAVE_SETTINGS); self._ser.flush()
-            logger.info("  → Save settings sent")
-            time.sleep(0.15)
+            time.sleep(0.20)
+
             self._ser.reset_input_buffer()
+            logger.info("  Init complete.")
         except serial.SerialException as exc:
             logger.warning("Init error: %s", exc)
 
     def _enable_output(self):
-        """Soft recovery: re-send enable command."""
+        """Soft recovery: re-send enable-output."""
         try:
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
             time.sleep(0.20)
             self._ser.reset_input_buffer()
-            logger.info("Soft recovery: enable-output re-sent.")
+            logger.info("Soft recovery done.")
         except Exception:
             pass
 
     def reconnect(self):
-        """Hard recovery: close and reopen the serial port completely."""
-        logger.warning("Hard reconnect: closing and reopening %s …", self.port)
+        """Hard recovery: close and fully reopen the serial port."""
+        logger.warning("Hard reconnect on %s …", self.port)
         try:
             self._connect(send_init=True)
-            logger.info("Reconnect successful.")
+            logger.info("Reconnect OK.")
         except Exception as exc:
             logger.error("Reconnect failed: %s", exc)
 
@@ -97,18 +108,16 @@ class TF02Pro:
         if len(data) != n:
             raise LiDARReadError(
                 f"Expected {n} bytes, got {len(data)} "
-                f"(sensor stopped — likely power glitch on VCC)"
+                f"(power glitch — check 5V supply)"
             )
         return data
 
     def _sync_and_read_frame(self):
-        for _ in range(FRAME_LEN * 6):
+        for _ in range(FRAME_LEN * 8):
             b1 = self._read_bytes(1)
-            if b1[0] != HEADER_BYTE:
-                continue
+            if b1[0] != HEADER_BYTE: continue
             b2 = self._read_bytes(1)
-            if b2[0] != HEADER_BYTE:
-                continue
+            if b2[0] != HEADER_BYTE: continue
             return b1 + b2 + self._read_bytes(FRAME_LEN - 2)
         raise LiDARReadError("Header 0x59 0x59 not found")
 
@@ -127,25 +136,19 @@ class TF02Pro:
     def read_frame(self, _retry=0):
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
-
         frame = self._sync_and_read_frame()
-
         if not self._checksum_ok(frame):
             if _retry < 3:
                 return self.read_frame(_retry=_retry + 1)
             raise LiDARReadError(f"Checksum fail: {frame.hex(' ')}")
-
         data = self._parse(frame)
         data["valid"] = (MIN_DIST_CM <= data["distance_cm"] <= MAX_DIST_CM)
-        # NOTE: no longer raising error for out-of-range — just sets valid=False
-        # so the caller can still see the reading and the stream keeps going
         return data
 
     def read_frame_current(self):
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("Port not open")
-        queued = self._ser.in_waiting
-        if queued > FRAME_LEN * 3:
+        if self._ser.in_waiting > FRAME_LEN * 3:
             self._ser.reset_input_buffer()
             time.sleep(0.012)
         return self.read_frame()
@@ -159,20 +162,16 @@ class TF02Pro:
         if self._ser and self._ser.is_open:
             self._ser.close()
             self.connected = False
-            logger.info("Port closed.")
 
     def __enter__(self): return self
     def __exit__(self, *_): self.close()
 
 
 class LiDARReaderThread:
-    """
-    Background thread that reads sensor at 100Hz continuously.
-    Auto-recovers from dropouts: soft recovery first, then hard reconnect.
-    """
+    """Background thread: reads at 100Hz, auto-recovers (soft then hard)."""
 
-    SOFT_RECOVER_AFTER = 3    # soft recovery after 3 consecutive errors
-    HARD_RECOVER_AFTER = 9    # hard reconnect after 9 consecutive errors (3 soft fails)
+    SOFT_AFTER = 3    # soft recovery (re-enable) after 3 errors
+    HARD_AFTER = 6    # hard recovery (reconnect) after 6 errors
 
     def __init__(self, lidar: TF02Pro, maxlen=5):
         self._lidar   = lidar
@@ -186,7 +185,6 @@ class LiDARReaderThread:
             target=self._loop, daemon=True, name="LiDARReader"
         )
         self._thread.start()
-        logger.info("LiDARReaderThread started.")
 
     def _loop(self):
         while self._running:
@@ -194,27 +192,24 @@ class LiDARReaderThread:
                 frame = self._lidar.read_frame()
                 with self._lock:
                     self._buf.append(frame)
-                self.frames  += 1
-                self._consec  = 0
-
+                self.frames += 1
+                self._consec = 0
             except LiDARReadError as exc:
                 self.errors  += 1
                 self._consec += 1
                 logger.debug("Error #%d: %s", self._consec, exc)
 
-                if self._consec == self.SOFT_RECOVER_AFTER:
-                    logger.warning("Soft recovery (re-enable output) …")
+                if self._consec == self.SOFT_AFTER:
+                    logger.warning("Soft recovery …")
                     self._lidar._enable_output()
-
-                elif self._consec >= self.HARD_RECOVER_AFTER:
-                    logger.warning("Hard recovery (port reconnect) …")
+                elif self._consec >= self.HARD_AFTER:
+                    logger.warning("Hard reconnect …")
                     self._lidar.reconnect()
                     self._consec = 0
 
                 time.sleep(0.005)
-
             except Exception as exc:
-                logger.error("Unexpected: %s", exc)
+                logger.error("Reader: %s", exc)
                 time.sleep(0.05)
 
     def get_latest(self):
