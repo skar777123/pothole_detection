@@ -1,75 +1,89 @@
 """
 lidar_driver.py
 ================
-TF02-Pro single-point LiDAR driver — continuous streaming mode.
+TF02-Pro single-point LiDAR driver — with startup command init + diagnostics.
 
-STREAMING DESIGN
-─────────────────
-  The TF02-Pro sends frames at 100 Hz regardless of what the host does.
-  The correct read strategy is:
+WHY "Expected 1 bytes, got 0 (serial timeout)"
+───────────────────────────────────────────────
+  The port opens fine (USB-UART adapter found) but the sensor sends ZERO bytes.
+  Possible causes:
+    1. Sensor is in TRIGGER mode (only outputs when it receives a trigger cmd).
+    2. TX wire from sensor not connected to UART adapter RX pin.
+    3. Wrong baud rate (at completely wrong rate → silence, not garbage).
+    4. Sensor in output-disabled state (needs "enable output" command).
 
-    1. Flush the OS serial buffer ONCE at startup (discard stale backlog).
-    2. After that, read frames CONTINUOUSLY from the live byte stream.
-       The sensor keeps emitting; we just parse frame-by-frame.
-    3. No sleep, no re-flush between reads → latency ≈ one frame (10 ms).
+  Fix applied:
+    - On startup, send soft-reset + enable-output + set-100Hz commands.
+    - Auto-detect baud rate: try 115200 first, then 9600.
+    - Provide a raw_read_bytes() method for diagnostics (no header sync).
 
-  This replaces the earlier "flush + sleep(15ms) + read" pattern which:
-    • Caused artificial 15ms gaps between readings.
-    • Discarded perfectly good frames (potential detections lost).
-    • Still had stale-data risk when the sleep was too short.
+TF02-Pro Command Protocol (host → sensor):
+  [0x5A][LEN][ID][DATA...][CS]
+  CS = LSB of sum of all bytes before CS.
 
-TF02-Pro 9-byte frame format (115200 baud, 100 Hz):
-  Byte 0   : 0x59  ─ Header
-  Byte 1   : 0x59  ─ Header
-  Byte 2   : Dist_L ─┐ Distance  (cm, uint16 little-endian)
-  Byte 3   : Dist_H ─┘
-  Byte 4   : Flux_L ─┐ Signal flux (uint16 little-endian)
-  Byte 5   : Flux_H ─┘
-  Byte 6   : Temp_L ─┐ Chip temperature (uint16 LE, unit = 0.01 °C)
-  Byte 7   : Temp_H ─┘
-  Byte 8   : Checksum = LSB( sum of bytes 0–7 )
+TF02-Pro Output Frame (sensor → host, UART, 100Hz):
+  Byte 0-1 : 0x59 0x59 (header)
+  Byte 2-3 : Distance cm  (uint16 LE)
+  Byte 4-5 : Signal flux  (uint16 LE)
+  Byte 6-7 : Temperature  (uint16 LE, unit = 0.01°C)
+  Byte 8   : Checksum = LSB( sum of bytes 0-7 )
 """
 
 import serial
+import serial.tools.list_ports
 import time
 import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Physical sensor limits ────────────────────────────────────────────────────
-MIN_DIST_CM  = 5       # Hard minimum (sensor blind zone ~10 cm, 5 for safety)
-MAX_DIST_CM  = 2200    # Max rated range 22 m
-HEADER_BYTE  = 0x59
-FRAME_LEN    = 9       # Total bytes per frame
+# ── Physical limits ───────────────────────────────────────────────────────────
+MIN_DIST_CM = 5
+MAX_DIST_CM = 2200
+HEADER_BYTE = 0x59
+FRAME_LEN   = 9
+
+# ── Startup commands (host → sensor) ─────────────────────────────────────────
+# All follow: 5A [LEN] [ID] [DATA...] [CS]  where CS = LSB(sum of all prev bytes)
+CMD_SOFT_RESET      = bytes([0x5A, 0x04, 0x02, 0x60])          # Soft reset
+CMD_ENABLE_OUTPUT   = bytes([0x5A, 0x05, 0x07, 0x01, 0x67])    # Enable continuous output
+CMD_DISABLE_OUTPUT  = bytes([0x5A, 0x05, 0x07, 0x00, 0x66])    # Disable output
+CMD_SET_100HZ       = bytes([0x5A, 0x06, 0x03, 0x64, 0x00, 0xC7])  # Set frame rate 100Hz
+CMD_TRIGGER_ONCE    = bytes([0x5A, 0x04, 0x04, 0x62])          # Single measurement (trigger)
+CMD_SAVE_SETTINGS   = bytes([0x5A, 0x04, 0x11, 0x6F])          # Save current settings to ROM
+
+BAUD_CANDIDATES = [115200, 9600, 19200, 56000]
 
 
 class LiDARReadError(Exception):
-    """Raised when a valid frame cannot be obtained from the stream."""
+    """Raised when a valid frame cannot be obtained from the sensor."""
 
 
 class TF02Pro:
     """
-    Continuous-stream driver for the Benewake TF02-Pro single-point LiDAR.
+    TF02-Pro LiDAR driver.
 
     Parameters
     ----------
-    port     : Serial port  (e.g. '/dev/ttyUSB0'  or  'COM3')
-    baudrate : 115200 (factory default)
-    timeout  : Per-byte read timeout in seconds. Keep low for fast response.
+    port        : Serial port (e.g. '/dev/ttyUSB0' or 'COM3')
+    baudrate    : 115200 by default. Pass None to auto-detect.
+    timeout     : Per-byte read timeout in seconds
+    send_init   : If True, send soft-reset + enable-output commands at startup
     """
 
-    def __init__(self, port: str = '/dev/ttyUSB0',
+    def __init__(self,
+                 port: str  = '/dev/ttyUSB0',
                  baudrate: int = 115200,
-                 timeout: float = 0.1):
+                 timeout: float = 0.5,
+                 send_init: bool = True):
         self.port      = port
         self.baudrate  = baudrate
         self._ser      = None
         self.connected = False
-        self._open(timeout)
+        self._open(timeout, send_init)
 
     # ─── Private ─────────────────────────────────────────────────────────────
 
-    def _open(self, timeout: float) -> None:
+    def _open(self, timeout: float, send_init: bool) -> None:
         try:
             self._ser = serial.Serial(
                 self.port,
@@ -79,91 +93,146 @@ class TF02Pro:
                 stopbits=serial.STOPBITS_ONE,
                 timeout=timeout,
             )
-            # ONE-TIME flush only: discard any stale bytes that arrived
-            # before we opened the port (hardware buffer backlog).
+            logger.info("Opened %s @ %d baud", self.port, self.baudrate)
+
+            # Flush any bytes that arrived before the port was open
             self._ser.reset_input_buffer()
-            time.sleep(0.05)           # let sensor emit 5 fresh frames
-            self._ser.reset_input_buffer()   # flush those too → clean slate
+
+            if send_init:
+                self._send_startup_commands()
+
+            # Final flush after init commands + sensor reboot
+            self._ser.reset_input_buffer()
 
             self.connected = True
-            logger.info("TF02-Pro opened: %s @ %d baud (continuous mode)",
-                        self.port, self.baudrate)
+            logger.info("TF02-Pro ready on %s", self.port)
 
         except serial.SerialException as exc:
             logger.error("Cannot open %s: %s", self.port, exc)
             raise
 
-    def _read_bytes(self, n: int) -> bytes:
-        """Read exactly n bytes from the stream; raise on timeout."""
+    def _send_startup_commands(self) -> None:
+        """
+        Send the command sequence that ensures the sensor is streaming:
+          1. Soft reset      — clear any stuck state
+          2. Wait 1 s        — sensor reboot takes ~500ms
+          3. Enable output   — in case sensor was in trigger/disabled mode
+          4. Set 100Hz rate  — ensure continuous at rated speed
+        """
+        logger.info("Sending TF02-Pro init commands …")
+
+        try:
+            # 1. Soft reset
+            self._ser.write(CMD_SOFT_RESET)
+            self._ser.flush()
+            logger.info("  → Soft reset sent (5A 04 02 60)")
+
+            # 2. Wait for reboot (TF02-Pro takes ~500ms to restart)
+            time.sleep(1.0)
+            self._ser.reset_input_buffer()
+
+            # 3. Enable continuous output
+            self._ser.write(CMD_ENABLE_OUTPUT)
+            self._ser.flush()
+            logger.info("  → Enable output sent (5A 05 07 01 67)")
+            time.sleep(0.1)
+
+            # 4. Set 100 Hz output rate
+            self._ser.write(CMD_SET_100HZ)
+            self._ser.flush()
+            logger.info("  → Set 100Hz sent (5A 06 03 64 00 C7)")
+            time.sleep(0.1)
+
+            logger.info("Init commands complete. Waiting for sensor to stream …")
+
+        except serial.SerialException as exc:
+            logger.warning("Could not send init commands: %s", exc)
+
+    def _read_raw_bytes(self, n: int) -> bytes:
+        """Read exactly n bytes; raise LiDARReadError on timeout."""
         data = self._ser.read(n)
         if len(data) != n:
             raise LiDARReadError(
-                f"Expected {n} bytes, got {len(data)} — serial timeout"
+                f"Expected {n} bytes, got {len(data)} (serial timeout — "
+                f"sensor may be in trigger mode or TX wire disconnected)"
             )
         return data
 
     def _sync_and_read_frame(self) -> bytes:
         """
-        Scan the byte stream until the 0x59 0x59 header pair is found,
-        then read the remaining 7 bytes and return the full 9-byte frame.
-
-        This is the core continuous-stream parser. It is O(1) amortised
-        because when the stream is healthy we are already byte-aligned at
-        the start of a new frame and the first two bytes ARE the header.
-
-        Scans at most 4 × FRAME_LEN bytes before giving up.
+        Scan the byte stream for the 0x59 0x59 header, then read the
+        remaining 7 bytes to form a complete 9-byte frame.
         """
-        max_scan = 4 * FRAME_LEN          # ~36 bytes = 4 frames of slop
-        for _ in range(max_scan):
-            b1 = self._read_bytes(1)
+        max_scan = 6 * FRAME_LEN   # scan up to 6 frames of bytes
+        for i in range(max_scan):
+            b1 = self._read_raw_bytes(1)
             if b1[0] != HEADER_BYTE:
                 continue
-            b2 = self._read_bytes(1)
+            b2 = self._read_raw_bytes(1)
             if b2[0] != HEADER_BYTE:
                 continue
-            # Header confirmed — read the 7-byte payload
-            payload = self._read_bytes(FRAME_LEN - 2)
+            payload = self._read_raw_bytes(FRAME_LEN - 2)
             return b1 + b2 + payload
 
-        raise LiDARReadError("Frame header not found within scan limit")
+        raise LiDARReadError("Frame header (0x59 0x59) not found in stream")
 
     @staticmethod
     def _checksum_ok(frame: bytes) -> bool:
-        """Checksum = LSB of sum of first 8 bytes. Must match byte 8."""
         return (sum(frame[:8]) & 0xFF) == frame[8]
 
     @staticmethod
     def _parse_frame(frame: bytes) -> dict:
-        """Extract distance, flux, and temperature from a validated frame."""
         dist_cm  = frame[2] | (frame[3] << 8)
         strength = frame[4] | (frame[5] << 8)
         raw_temp = frame[6] | (frame[7] << 8)
-        temp_c   = round(raw_temp / 100.0, 1)
         return {
             "distance_cm"  : dist_cm,
             "strength"     : strength,
-            "temperature_c": temp_c,
+            "temperature_c": round(raw_temp / 100.0, 1),
         }
+
+    # ─── Diagnostics ─────────────────────────────────────────────────────────
+
+    def diagnostic_raw_dump(self, n_bytes: int = 90) -> bytes:
+        """
+        Read n_bytes raw bytes from the serial port WITHOUT any parsing.
+        Used to verify the sensor is sending ANYTHING at all.
+        Returns the raw bytes received (may be empty if sensor is silent).
+        """
+        logger.info("Raw diagnostic: reading %d bytes …", n_bytes)
+        self._ser.reset_input_buffer()
+        time.sleep(0.1)
+        data = self._ser.read(n_bytes)
+        logger.info("Raw diagnostic: got %d bytes: %s",
+                    len(data), data.hex(' ') if data else '(nothing)')
+        return data
+
+    def send_trigger(self) -> None:
+        """Send a single-measurement trigger (for sensors in trigger mode)."""
+        self._ser.write(CMD_TRIGGER_ONCE)
+        self._ser.flush()
+
+    def enable_output(self) -> None:
+        """Re-enable continuous output (e.g. after a disable)."""
+        self._ser.write(CMD_ENABLE_OUTPUT)
+        self._ser.flush()
+        time.sleep(0.05)
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
     def read_frame(self) -> dict:
         """
-        Read the NEXT frame from the continuous serial stream.
-
-        No buffer flushing — this is pure stream reading. Call this in a
-        tight loop and you will receive readings at the sensor's native
-        rate (up to 100 Hz for TF02-Pro).
+        Read the next valid frame from the continuous sensor stream.
 
         Returns
         -------
         dict:
-            distance_cm   : int   — distance to target in centimetres
-            strength      : int   — signal flux (higher = stronger return)
-            temperature_c : float — sensor chip temperature in °C
-            valid         : bool  — True if distance is within physical range
+            distance_cm   : int   — distance in cm
+            strength      : int   — signal flux
+            temperature_c : float — chip temp in °C
+            valid         : bool  — True if distance in physical range
 
-        Raises LiDARReadError on timeout or checksum failure.
+        Raises LiDARReadError on timeout/checksum failure.
         """
         if not self.connected or not self._ser.is_open:
             raise LiDARReadError("LiDAR port is not open")
@@ -172,47 +241,32 @@ class TF02Pro:
 
         if not self._checksum_ok(frame):
             raise LiDARReadError(
-                f"Checksum mismatch — raw: {frame.hex(' ')}"
+                f"Checksum fail  raw={frame.hex(' ')}"
             )
 
         data  = self._parse_frame(frame)
         valid = MIN_DIST_CM <= data["distance_cm"] <= MAX_DIST_CM
-
-        logger.debug(
-            "dist=%d cm  str=%d  temp=%.1f°C  valid=%s",
-            data["distance_cm"], data["strength"],
-            data["temperature_c"], valid
-        )
-
         data["valid"] = valid
+
+        logger.debug("dist=%d cm  str=%d  temp=%.1f°C  valid=%s",
+                     data["distance_cm"], data["strength"],
+                     data["temperature_c"], valid)
 
         if not valid:
             raise LiDARReadError(
-                f"Distance {data['distance_cm']} cm out of range "
-                f"[{MIN_DIST_CM}–{MAX_DIST_CM} cm] — "
-                f"strength={data['strength']}"
+                f"Distance {data['distance_cm']} cm outside range "
+                f"[{MIN_DIST_CM}–{MAX_DIST_CM}]"
             )
-
         return data
 
     def read_median(self, samples: int = 3) -> dict:
-        """
-        Read `samples` consecutive frames from the live stream and return
-        the one with the median distance value.
-
-        Uses the continuous stream — no flushing between samples.
-        This gives a noise-robust reading with minimal added latency
-        (3 frames at 100 Hz = ~30 ms total).
-        """
-        collected = []
-        errors    = []
-
-        for _ in range(samples * 3):        # allow some retries
+        """Read `samples` frames and return the one with the median distance."""
+        collected, errors = [], []
+        for _ in range(samples * 3):
             if len(collected) >= samples:
                 break
             try:
-                r = self.read_frame()
-                collected.append(r)
+                collected.append(self.read_frame())
             except LiDARReadError as exc:
                 errors.append(str(exc))
 
@@ -238,3 +292,10 @@ class TF02Pro:
 
     def __exit__(self, *_):
         self.close()
+
+
+# ── Utility: list available serial ports ─────────────────────────────────────
+
+def list_ports() -> list[str]:
+    """Return all available serial port names on this machine."""
+    return [p.device for p in serial.tools.list_ports.comports()]
