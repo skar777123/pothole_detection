@@ -85,7 +85,10 @@ class TF02Pro:
 
     def __init__(self, port: str = '/dev/ttyUSB0',
                  baudrate: int = 115200,
-                 timeout: float = 0.05,   # 50ms — at 100Hz bytes arrive every 10ms max
+                 timeout: float = 0.10,   # 100ms: covers worst-case USB-UART latency timer
+                                          # (CH340/CP210x can add up to 16ms per USB packet)
+                                          # At 100Hz sensor: bytes arrive every 10ms max
+                                          # so 100ms = 10× safety margin, 5× faster than old 500ms
                  send_init: bool = True):
         self.port      = port
         self.baudrate  = baudrate
@@ -141,12 +144,16 @@ class TF02Pro:
             logger.warning("Init command error: %s", exc)
 
     def _enable_output(self) -> None:
-        """Re-send enable-output mid-session (auto-recover)."""
+        """
+        Re-send enable-output mid-session and flush stale buffer.
+        Called automatically after N consecutive read errors (power-glitch recovery).
+        """
         try:
             self._ser.write(CMD_ENABLE_OUTPUT); self._ser.flush()
             logger.info("Re-sent enable-output (auto-recover).")
-            time.sleep(0.15)
-            self._ser.reset_input_buffer()
+            time.sleep(0.20)               # give sensor time to restart streaming
+            self._ser.reset_input_buffer() # discard any partial/corrupt bytes
+            logger.info("Buffer flushed after recovery.")
         except Exception:
             pass
 
