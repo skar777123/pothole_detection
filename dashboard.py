@@ -300,16 +300,12 @@ def run_detection(model):
 
         if frame is None:
             no_data_count += 1
-            if no_data_count > 200:
-                st.error(
-                    "❌ No frames received after 200 polls.\n\n"
-                    f"Thread errors: {reader.errors}. "
-                    "Check sensor connection and run Diagnostic below."
-                )
-                break
+            # Show retry status — keep trying indefinitely (don't stop)
             status_ph.warning(
-                f"⏳ Waiting for first frame … (poll #{no_data_count}, "
-                f"thread errors: {reader.errors})"
+                f"⏳ Waiting for sensor frames …  "
+                f"Poll #{no_data_count} | Thread errors: {reader.errors} | "
+                f"Thread frames: {reader.frames}  \n\n"
+                f"{'🔴 Sensor silent — check USB connection & power' if reader.errors > 10 else '🟡 Starting up …'}"
             )
             time.sleep(0.05)
             continue
