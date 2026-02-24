@@ -35,7 +35,6 @@ from model_train import (
     extract_features, WINDOW_SIZE,
     POTHOLE_THRESH, BUMP_THRESH,
     BASELINE_CM as DEFAULT_BASELINE,
-    BASELINE_MIN_CM, BASELINE_MAX_CM,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -87,9 +86,8 @@ _defaults = {
     "running"        : False,
     "confirm_streak" : 0,
     "last_depth"     : 0.0,
-    "calib_readings" : [],
-    "baseline_cm"    : float(DEFAULT_BASELINE),
-    "calibrated"     : False,
+    "baseline_cm"    : 1000.0,   # fixed: 1000 cm (10 m)
+    "calibrated"     : True,     # always ready — no calibration needed
     "dist_buf"       : [],
     "str_buf"        : [],
     "last_detect_t"  : 0.0,
@@ -115,34 +113,22 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📏 Baseline")
-    st.caption(f"Valid range: {BASELINE_MIN_CM}–{BASELINE_MAX_CM} cm  "
-               f"(TF02-Pro: up to 10 m)")
-    manual_baseline = st.number_input(
-        "Road distance (cm)",
-        min_value=BASELINE_MIN_CM,
-        max_value=BASELINE_MAX_CM,
-        value=min(int(st.session_state.baseline_cm), BASELINE_MAX_CM),
-        step=10,
-        help="Distance from sensor to flat road surface. "
-             "Adjust for your mounting height (up to 1000 cm / 10 m)."
-    )
-    calib_n      = st.slider("Calibration samples", 5, 60, 20)
-    bypass_calib = st.checkbox("Skip calibration (use manual value)", value=False)
+    st.metric("Fixed Baseline", "1000 cm (10 m)",
+              help="Sensor is mounted 10 m above the road surface. "
+                   "Baseline is fixed — no calibration required.")
 
     st.markdown("---")
     st.subheader("🔍 Detection")
-    # At long range (>500 cm) TF02-Pro noise is ~2–4 cm, so auto-hint
-    _noise_hint = max(3.0, manual_baseline * 0.004)
-    st.caption(f"💡 At {manual_baseline} cm baseline, sensor noise ≈ "
-               f"±{_noise_hint:.1f} cm — keep thresholds above this.")
+    # TF02-Pro noise at 10 m ≈ ±4 cm → thresholds default just above noise floor
+    _NOISE_AT_10M = 4.0
     pot_thresh  = st.number_input("Shallow threshold (cm)", 1.0, 30.0,
-                                  value=max(float(POTHOLE_THRESH), round(_noise_hint + 0.5, 1)),
-                                  step=0.5)
+                                  value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
+                                  help="Positive deviation to trigger shallow pothole.")
     deep_thresh = st.number_input("Deep threshold (cm)", 1.0, 50.0,
                                   value=float(DEEP_THRESH_CM), step=0.5)
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
-                                  value=max(float(BUMP_THRESH), round(_noise_hint + 0.5, 1)),
-                                  step=0.5)
+                                  value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
+                                  help="Negative deviation to trigger speed bump.")
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
     cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
                                   value=DETECTION_COOLDOWN_S, step=0.5)
@@ -280,7 +266,6 @@ def run_detection(model):
 
     st.markdown("---")
     status_ph = st.empty()
-    calib_ph  = st.empty()
 
     st.markdown("### 📡 Live Stream")
     ca, cb = st.columns(2)
@@ -298,11 +283,6 @@ def run_detection(model):
     last_ui_t = 0.0
     UI_INTERVAL = 0.10     # update UI at 10 Hz
     no_data_count = 0
-
-    if bypass_calib and not st.session_state.calibrated:
-        st.session_state.baseline_cm = float(manual_baseline)
-        st.session_state.calibrated  = True
-        calib_ph.success(f"✅ Manual baseline: **{manual_baseline} cm**")
 
     logger.info("Detection started (background thread). Baseline=%.1f cm",
                 st.session_state.baseline_cm)
@@ -338,38 +318,6 @@ def run_detection(model):
                 f"(valid range 1–2200 cm) — skipping frame"
             )
             time.sleep(0.02)
-            continue
-
-        # ── CALIBRATION ───────────────────────────────────────────────────────
-        if not st.session_state.calibrated:
-            readings = st.session_state.calib_readings
-            # Only add each unique frame once (thread gives same frame until new one arrives)
-            if not readings or readings[-1] != dist:
-                readings.append(dist)
-            done = len(readings)
-
-            calib_ph.info(
-                f"🔵 **Calibrating** {done}/{calib_n} — "
-                f"dist: **{dist} cm** | str: {strength} | temp: {temp}°C — "
-                f"Keep sensor over flat ground."
-            )
-
-            if done >= calib_n:
-                cal = sorted(readings)
-                st.session_state.baseline_cm = float(cal[len(cal) // 2])
-                st.session_state.calibrated  = True
-                calib_ph.success(
-                    f"✅ Baseline locked: **{st.session_state.baseline_cm:.1f} cm** "
-                    f"(median of {done} readings)"
-                )
-                logger.info("Baseline: %.1f cm", st.session_state.baseline_cm)
-
-            # Update histories for chart even during calibration
-            st.session_state.dist_history.append(dist)
-            st.session_state.dev_history.append(dist - st.session_state.baseline_cm)
-            st.session_state.str_history.append(strength)
-            st.session_state.baseline_hist.append(st.session_state.baseline_cm)
-            time.sleep(0.05)
             continue
 
         # ── ACTIVE DETECTION ──────────────────────────────────────────────────
@@ -541,17 +489,11 @@ if model is None:
     st.warning("⚠️ `pothole_model.pkl` not found — rule-only mode. "
                "Run `python model_train.py` to enable ML.")
 
-if not st.session_state.calibrated:
-    st.session_state.baseline_cm = float(manual_baseline)
-
 if not st.session_state.running:
     c1, _ = st.columns([2, 5])
     with c1:
         if st.button("▶ Start Monitoring", type="primary"):
-            st.session_state.running        = True
-            if not bypass_calib:
-                st.session_state.calibrated     = False
-                st.session_state.calib_readings = []
+            st.session_state.running = True
             st.rerun()
 
     st.markdown("---")

@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore")
 # ── Shared constants (imported by dashboard.py) ───────────────────────────────
 WINDOW_SIZE      = 20          # Readings per inference window
 N_SAMPLES        = 8000        # More samples for wider baseline coverage
-BASELINE_CM      = 300         # Default mounting height (cm) — mid-range for 0.1–10 m
+BASELINE_CM      = 1000        # Fixed sensor-to-road distance: 10 m (1000 cm)
 NOISE_STD        = 1.5         # Road surface noise at close range (cm)
 BASELINE_MIN_CM  = 50          # Minimum baseline used during training
 BASELINE_MAX_CM  = 1000        # Maximum baseline used during training (10 m)
