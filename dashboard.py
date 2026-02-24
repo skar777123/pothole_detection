@@ -35,6 +35,7 @@ from model_train import (
     extract_features, WINDOW_SIZE,
     POTHOLE_THRESH, BUMP_THRESH,
     BASELINE_CM as DEFAULT_BASELINE,
+    BASELINE_MIN_CM, BASELINE_MAX_CM,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -114,20 +115,34 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📏 Baseline")
-    manual_baseline = st.number_input("Road distance (cm)", 10, 2000,
-                                      value=int(st.session_state.baseline_cm),
-                                      step=5)
+    st.caption(f"Valid range: {BASELINE_MIN_CM}–{BASELINE_MAX_CM} cm  "
+               f"(TF02-Pro: up to 10 m)")
+    manual_baseline = st.number_input(
+        "Road distance (cm)",
+        min_value=BASELINE_MIN_CM,
+        max_value=BASELINE_MAX_CM,
+        value=min(int(st.session_state.baseline_cm), BASELINE_MAX_CM),
+        step=10,
+        help="Distance from sensor to flat road surface. "
+             "Adjust for your mounting height (up to 1000 cm / 10 m)."
+    )
     calib_n      = st.slider("Calibration samples", 5, 60, 20)
     bypass_calib = st.checkbox("Skip calibration (use manual value)", value=False)
 
     st.markdown("---")
     st.subheader("🔍 Detection")
+    # At long range (>500 cm) TF02-Pro noise is ~2–4 cm, so auto-hint
+    _noise_hint = max(3.0, manual_baseline * 0.004)
+    st.caption(f"💡 At {manual_baseline} cm baseline, sensor noise ≈ "
+               f"±{_noise_hint:.1f} cm — keep thresholds above this.")
     pot_thresh  = st.number_input("Shallow threshold (cm)", 1.0, 30.0,
-                                  value=float(POTHOLE_THRESH), step=0.5)
+                                  value=max(float(POTHOLE_THRESH), round(_noise_hint + 0.5, 1)),
+                                  step=0.5)
     deep_thresh = st.number_input("Deep threshold (cm)", 1.0, 50.0,
                                   value=float(DEEP_THRESH_CM), step=0.5)
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
-                                  value=float(BUMP_THRESH), step=0.5)
+                                  value=max(float(BUMP_THRESH), round(_noise_hint + 0.5, 1)),
+                                  step=0.5)
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
     cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
                                   value=DETECTION_COOLDOWN_S, step=0.5)
