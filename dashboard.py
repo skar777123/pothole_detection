@@ -75,22 +75,26 @@ def load_model():
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
+BASELINE_WINDOW = 20   # number of readings used to compute rolling baseline
+
 _defaults = {
-    "dist_history"   : deque(maxlen=500),
-    "dev_history"    : deque(maxlen=500),
-    "str_history"    : deque(maxlen=500),
-    "baseline_hist"  : deque(maxlen=500),
-    "pothole_count"  : 0,
-    "bump_count"     : 0,
-    "pothole_log"    : [],
-    "running"        : False,
-    "confirm_streak" : 0,
-    "last_depth"     : 0.0,
-    "baseline_cm"    : 1000.0,   # fixed: 1000 cm (10 m)
-    "calibrated"     : True,     # always ready — no calibration needed
-    "dist_buf"       : [],
-    "str_buf"        : [],
-    "last_detect_t"  : 0.0,
+    "dist_history"      : deque(maxlen=500),
+    "dev_history"       : deque(maxlen=500),
+    "str_history"       : deque(maxlen=500),
+    "baseline_hist"     : deque(maxlen=500),
+    "pothole_count"     : 0,
+    "bump_count"        : 0,
+    "pothole_log"       : [],
+    "running"           : False,
+    "confirm_streak"    : 0,
+    "last_depth"        : 0.0,
+    # Rolling baseline — updated every frame as mean of last 20 readings
+    "baseline_cm"       : None,          # None until first 20 readings arrive
+    "rolling_baseline_buf": deque(maxlen=BASELINE_WINDOW),
+    "calibrated"        : False,         # True once baseline_buf is full
+    "dist_buf"          : [],
+    "str_buf"           : [],
+    "last_detect_t"     : 0.0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -112,10 +116,16 @@ with st.sidebar:
                              help="Soft-reset + enable-output + 100Hz on connect")
 
     st.markdown("---")
-    st.subheader("📏 Baseline")
-    st.metric("Fixed Baseline", "1000 cm (10 m)",
-              help="Sensor is mounted 10 m above the road surface. "
-                   "Baseline is fixed — no calibration required.")
+    st.subheader("📏 Rolling Baseline")
+    _bl = st.session_state.baseline_cm
+    _bl_buf_len = len(st.session_state.rolling_baseline_buf)
+    if _bl is None:
+        st.metric("Live Baseline", f"Warming up … ({_bl_buf_len}/{BASELINE_WINDOW})",
+                  help=f"Collecting first {BASELINE_WINDOW} readings to establish baseline.")
+    else:
+        st.metric("Live Baseline", f"{_bl:.1f} cm",
+                  help=f"Rolling mean of last {BASELINE_WINDOW} valid distance readings. "
+                       "Updates every frame automatically.")
 
     st.markdown("---")
     st.subheader("🔍 Detection")
@@ -320,7 +330,24 @@ def run_detection(model):
             time.sleep(0.02)
             continue
 
-        # ── ACTIVE DETECTION ──────────────────────────────────────────────────
+        # ── ROLLING BASELINE (mean of last 20 readings) ───────────────────────
+        st.session_state.rolling_baseline_buf.append(dist)
+        if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
+            st.session_state.baseline_cm  = float(
+                np.mean(st.session_state.rolling_baseline_buf)
+            )
+            st.session_state.calibrated = True
+
+        # Skip detection until baseline is fully established
+        if not st.session_state.calibrated:
+            _n = len(st.session_state.rolling_baseline_buf)
+            status_ph.info(
+                f"⏳ Establishing baseline … ({_n}/{BASELINE_WINDOW} readings) "
+                f"| Current dist: **{dist} cm**"
+            )
+            time.sleep(0.02)
+            continue
+
         baseline = st.session_state.baseline_cm
         dev      = dist - baseline
 
