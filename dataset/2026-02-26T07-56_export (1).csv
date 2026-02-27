@@ -1,0 +1,9 @@
+﻿,Time,Type,Dev (cm),Depth (cm),Length (cm),Width (cm),Severity,Conf.,Strength,Baseline
+0,13:26:03,🔶 Speed Bump,-90.9,25.1,8.3,6.6,🔴 Deep/Dangerous,rule,4074,352
+1,13:25:59,🔶 Speed Bump,-28.8,20.2,33.3,26.6,🔴 Deep/Dangerous,rule,2506,381
+2,13:25:55,🔶 Speed Bump,-15.8,20.2,66.7,53.4,🔴 Deep/Dangerous,rule,2110,393
+3,13:25:51,🟡 Shallow Pothole,+5.9,17.9,41.7,33.4,🔴 Deep/Dangerous,rule,2093,395
+4,13:25:46,🔶 Speed Bump,-11.4,6.6,25,20,⚠️ Shallow,rule,2134,395
+5,13:25:42,🔶 Speed Bump,-16.8,47.2,8.3,6.6,🔴 Deep/Dangerous,rule,2295,404
+6,13:25:36,🔶 Speed Bump,-26.4,50.6,41.7,33.4,🔴 Deep/Dangerous,rule,2605,400
+7,13:25:31,🔴 Deep Pothole,+59.9,59.9,8.3,6.6,🔴 Deep/Dangerous,rule,2782,391
