@@ -84,7 +84,7 @@ N_SYNTHETIC_SAMPLES = 20_000   # Synthetic rows per class (×4 = total)
 REAL_AUGMENT_FACTOR =     50   # Each real row is augmented × this many times
 
 BATCH_SIZE   =  64
-EPOCHS       = 120
+EPOCHS       = 30
 LEARNING_RATE = 1e-3
 LR_PATIENCE  =  12    # ReduceLROnPlateau patience
 ES_PATIENCE  =  25    # EarlyStopping patience
