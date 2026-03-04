@@ -112,14 +112,36 @@ class _MovingAverageBaseline:
     Key insight: as the vehicle goes uphill / downhill the baseline drifts
     slowly, but a pothole causes a sudden spike. The MA baseline adapts to the
     slope while staying insensitive to the short spike.
+
+    IMPORTANT: Once calibrated, readings that deviate more than
+    `freeze_thresh` cm from the current baseline are NOT added to the
+    buffer.  This prevents the baseline from 'chasing' a pothole or bump
+    and keeps it locked to the normal road surface.
     """
 
-    def __init__(self, window: int = ADAPT_MA_WINDOW):
+    def __init__(self, window: int = ADAPT_MA_WINDOW,
+                 freeze_thresh: float = None):
         self._buf = deque(maxlen=window)
         self._sum = 0.0
+        # Default freeze threshold: max of POTHOLE_THRESH and BUMP_THRESH
+        self._freeze_thresh = freeze_thresh or max(POTHOLE_THRESH, BUMP_THRESH)
 
     def update(self, dist_cm: float) -> float:
-        """Push one reading; return current adaptive baseline."""
+        """Push one reading; return current adaptive baseline.
+
+        If the baseline is already calibrated (window full) and the new
+        reading deviates by more than ``freeze_thresh`` from the current
+        mean, it is *excluded* from the buffer so the baseline stays
+        locked to the normal surface distance.
+        """
+        if self.ready:
+            current_baseline = self._sum / len(self._buf)
+            deviation = abs(dist_cm - current_baseline)
+            if deviation > self._freeze_thresh:
+                # Anomalous reading → freeze baseline, return current mean
+                return current_baseline
+
+        # Normal reading → update buffer
         if len(self._buf) == self._buf.maxlen:
             self._sum -= self._buf[0]        # remove oldest
         self._buf.append(dist_cm)
@@ -226,7 +248,9 @@ class _DepthDurationGuard:
         confirmed  : deviation has been sustained for ≥ min_duration readings
         run_length : current consecutive-readings count above threshold
         """
-        if deviation > self._thresh:
+        # CRITICAL FIX: To detect hands/bumps, we must check absolute deviation
+        # since bumps are negative deviations
+        if abs(deviation) > self._thresh:
             self._run += 1
         else:
             self._run  = 0
@@ -309,11 +333,14 @@ def _rule_based_classify(
             return 1, round(confidence, 4)
 
     # Not confirmed but still has meaningful deviation → suspicious
-    if ma_dev > POTHOLE_THRESH and run_length > 0:
+    if run_length > 0:
         conf = run_length / ADAPT_MIN_DURATION * 0.5
-        return 1, round(min(conf, 0.55), 4)
+        if ma_dev > POTHOLE_THRESH:
+            return 1, round(min(conf, 0.55), 4)      # Suspicious Pothole
+        elif ma_dev < -BUMP_THRESH:
+            return 3, round(min(conf, 0.55), 4)      # Suspicious Bump
 
-    return 0, round(max(0.0, 1.0 - abs(ma_dev) / POTHOLE_THRESH), 4)
+    return 0, round(max(0.0, 1.0 - abs(ma_dev) / max(POTHOLE_THRESH, BUMP_THRESH)), 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -351,14 +378,15 @@ class AdaptiveDetector:
     """
 
     def __init__(self,
-                 use_model:            bool  = False,
-                 ma_window:            int   = ADAPT_MA_WINDOW,
-                 hp_alpha:             float = ADAPT_HP_ALPHA,
-                 min_duration:         int   = ADAPT_MIN_DURATION,
+                 use_model: bool = True,
+                 ma_window: int = ADAPT_MA_WINDOW,
+                 hp_alpha: float = ADAPT_HP_ALPHA,
+                 min_duration: int = ADAPT_MIN_DURATION,
                  confidence_threshold: float = RT_CONFIDENCE_THRESHOLD,
-                 alert_depth_cm:       float = RT_ALERT_DEPTH_CM):
+                 alert_depth_cm: float = RT_ALERT_DEPTH_CM):
 
-        self._use_model     = use_model
+        # FORCED RULE-BASED ONLY: User requested to comment out DL lines
+        self._use_model   = False # use_model (Disabled)
         self._conf_thresh   = confidence_threshold
         self._alert_depth   = alert_depth_cm
 
@@ -376,7 +404,8 @@ class AdaptiveDetector:
         self.alert: bool                = False
         self._lock = threading.Lock()
 
-        if use_model:
+        # FORCED RULE-BASED ONLY: Do not load model
+        if False: # use_model:
             _load_model()
 
     # ── public API ─────────────────────────────────────────────────────────────
@@ -423,11 +452,14 @@ class AdaptiveDetector:
         vel, spike_up, spike_down = self._drv.update(dist)
         self._vel_history.append(vel)
 
-        # Stage 4 – Depth-Duration guard
-        confirmed, run_len = self._dur.update(ma_dev)
+        # Stage 4 – Depth-Duration guard  (uses absolute deviation for both
+        # potholes and bumps)
+        abs_dev = abs(ma_dev)
+        confirmed, run_len = self._dur.update(abs_dev)
 
         # Push into feature buffer
-        above_flag = 1.0 if ma_dev > POTHOLE_THRESH else 0.0
+        # Flag is 1.0 if deviation exceeds pothole OR bump threshold
+        above_flag = 1.0 if (ma_dev > POTHOLE_THRESH or ma_dev < -BUMP_THRESH) else 0.0
         self._fbuf.push(dist, strength, ma_dev, hp, vel, above_flag)
 
         # We need the baseline window filled before we trust ma_dev
@@ -435,7 +467,8 @@ class AdaptiveDetector:
             return None
 
         # ── Classify ─────────────────────────────────────────────────────────
-        if self._use_model and self._fbuf.ready:
+        # FORCED RULE-BASED ONLY: Ignoring LSTM model logic
+        if False: # self._use_model and self._fbuf.ready:
             result = self._model_infer(
                 dist, strength, ma_dev, hp, vel,
                 baseline, confirmed, run_len, spike_up, spike_down
@@ -451,9 +484,52 @@ class AdaptiveDetector:
                 confirmed, run_len
             )
 
+        # ── Sanity guard & Forced Overrides ──────────────────────────────────
+        # 1. Override model classification if the actual deviation is too small
+        # (prevents LiDAR noise from being classified as anomalies).
+        cls = result["class_id"]
+        if cls in (1, 2) and ma_dev < POTHOLE_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / POTHOLE_THRESH), 4)
+        elif cls == 3 and ma_dev > -BUMP_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / BUMP_THRESH), 4)
+            
+        # 2. Forced Anomaly Override: If the DL model is confused by an extremely 
+        # sudden, massive deviation (like a hand blocking the sensor) and predicts 
+        # "Flat Road", we FORCE the class to the correct anomaly type.
+        if confirmed and result["class_id"] == 0:
+            if ma_dev > POTHOLE_THRESH * 2:  # Huge positive deviation (deep pothole)
+                result["class_id"] = 2
+                result["class_name"] = CLASS_NAMES[2]
+                result["confidence"] = 0.99
+            elif ma_dev < -BUMP_THRESH:      # Moderate/Huge negative deviation (bump/hand)
+                result["class_id"] = 3
+                result["class_name"] = CLASS_NAMES[3]
+                result["confidence"] = 0.99
+        # small — prevents LiDAR noise from being classified as anomalies.
+        cls = result["class_id"]
+        if cls in (1, 2) and ma_dev < POTHOLE_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / POTHOLE_THRESH), 4)
+        elif cls == 3 and ma_dev > -BUMP_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / BUMP_THRESH), 4)
+            
+        # Recompute depth and severity specifically for alerts
+        if result["class_id"] == 3:  # Bump
+            # Depth is the extent to which it protrudes up from the baseline
+            # (ma_dev is negative, so depth is abs(ma_dev))
+            result["depth_cm"] = round(abs(ma_dev), 1)
+            result["severity"] = _severity_label(result["depth_cm"])
+        
         self.latest_result = result
         self.alert = (
-            result["class_id"] in (1, 2) and
+            result["class_id"] in (1, 2, 3) and  # Including bumps / obstacles in alerts
             result["depth_cm"] >= self._alert_depth
         )
         result["alert"] = self.alert
@@ -466,6 +542,9 @@ class AdaptiveDetector:
         """Run the LSTM on the current 6-feature window."""
         window = self._fbuf.as_array()          # (WINDOW_SIZE, 6)
 
+        # Determine how many features the model actually expects
+        model_n_features = _model.input_shape[-1]   # e.g. 3 or 6
+
         # Normalise using saved scaler.
         # Scaler was fitted on 3-feature data; we handle mismatch gracefully:
         # if scaler has 3 features we scale only the first 3 columns.
@@ -473,16 +552,20 @@ class AdaptiveDetector:
             if _scaler.n_features_in_ == ADAPT_N_FEATURES:
                 flat   = window.reshape(-1, ADAPT_N_FEATURES)
                 flat   = _scaler.transform(flat).astype(np.float32)
-                tensor = flat.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
+                window = flat.reshape(WINDOW_SIZE, ADAPT_N_FEATURES)
             else:
                 # Scaler was trained on 3-feature data – scale 3-feature slice
                 flat3   = window[:, :3].reshape(-1, 3)
                 flat3   = _scaler.transform(flat3).astype(np.float32)
                 window[:, :3] = flat3.reshape(WINDOW_SIZE, 3)
-                tensor  = window.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
         except Exception:
-            tensor = window.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
+            pass
 
+        # Slice to match the model's expected feature count
+        if model_n_features < window.shape[1]:
+            window = window[:, :model_n_features]
+
+        tensor = window.reshape(1, WINDOW_SIZE, model_n_features)
         probs      = _model.predict(tensor, verbose=0)[0]   # (4,)
         class_id   = int(np.argmax(probs))
         confidence = float(probs[class_id])
@@ -504,7 +587,7 @@ class AdaptiveDetector:
                       confirmed, run_len,
                       probs=None) -> dict:
         """Assemble the standardised result dict."""
-        depth_cm = round(max(0.0, ma_dev), 1)
+        depth_cm = round(abs(ma_dev) if (class_id == 3 or ma_dev < 0) else max(0.0, ma_dev), 1)
         severity = _severity_label(depth_cm)
 
         # Velocity pattern: look for historical spike-up then spike-down

@@ -31,7 +31,7 @@ from dl_config import (
     RT_CONFIDENCE_THRESHOLD, RT_ALERT_DEPTH_CM,
     MODEL_SAVE_PATH, HISTORY_SAVE_PATH, LOGS_DIR,
     ADAPT_MA_WINDOW, ADAPT_HP_ALPHA, ADAPT_MIN_DURATION,
-    POTHOLE_THRESH, BUMP_THRESH,
+    POTHOLE_THRESH, BUMP_THRESH, SEVERITY_LEVELS,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -95,9 +95,11 @@ def _init_state():
     defaults = {
         "readings"   : [],      # raw distance readings
         "strengths"  : [],
+        "baselines"  : [],      # adaptive baseline values
         "results"    : [],      # inference result dicts
         "alerts"     : [],      # alert events
-        "running"    : False,
+        "events"     : [],      # detected pothole/bump events with dimensions
+        "running"    : True,
         "total"      : 0,
         "detector"   : None,
     }
@@ -106,6 +108,77 @@ def _init_state():
             st.session_state[k] = v
 
 _init_state()
+
+
+# ── Event extraction ───────────────────────────────────────────────────────────
+def _extract_events(results: list[dict],
+                    vehicle_speed_kmh: float,
+                    sample_rate_hz: float) -> list[dict]:
+    """
+    Scan results and group consecutive anomalous readings into discrete
+    pothole / speed-bump events with dimension estimates.
+
+    Length formula:  length_cm = n_readings × (speed_cm_per_sec / sample_rate_hz)
+    """
+    if not results:
+        return []
+
+    speed_cm_s = vehicle_speed_kmh * 100_000 / 3600   # km/h → cm/s
+    cm_per_reading = speed_cm_s / max(sample_rate_hz, 0.1)
+
+    events: list[dict] = []
+    i = 0
+    while i < len(results):
+        r = results[i]
+        cls = r["class_id"]
+        # Only track anomalies (1=shallow, 2=deep, 3=bump)
+        if cls in (1, 2, 3):
+            # Start of an event — gather consecutive anomalous readings
+            event_readings = [r]
+            j = i + 1
+            while j < len(results) and results[j]["class_id"] in (1, 2, 3):
+                event_readings.append(results[j])
+                j += 1
+
+            n = len(event_readings)
+            depths = [er["depth_cm"] for er in event_readings]
+            max_depth = max(depths)
+            avg_depth = sum(depths) / n
+            length_cm  = round(n * cm_per_reading, 1)
+
+            # Determine dominant type
+            type_counts = {1: 0, 2: 0, 3: 0}
+            for er in event_readings:
+                type_counts[er["class_id"]] += 1
+            dominant = max(type_counts, key=type_counts.get)
+
+            # Severity from max depth
+            severity = "Noise"
+            for label, (lo, hi) in SEVERITY_LEVELS.items():
+                if lo <= max_depth < hi:
+                    severity = label
+                    break
+
+            events.append({
+                "event_id"     : len(events) + 1,
+                "type"         : CLASS_NAMES[dominant],
+                "type_id"      : dominant,
+                "n_readings"   : n,
+                "max_depth_cm" : round(max_depth, 1),
+                "avg_depth_cm" : round(avg_depth, 1),
+                "length_cm"    : length_cm,
+                "length_m"     : round(length_cm / 100, 2),
+                "severity"     : severity,
+                "confidence"   : round(
+                    sum(er["confidence"] for er in event_readings) / n, 4),
+                "start_reading": i,
+                "end_reading"  : j - 1,
+                "timestamp"    : event_readings[0].get("timestamp", 0),
+            })
+            i = j
+        else:
+            i += 1
+    return events
 
 
 # ── Detector loader ────────────────────────────────────────────────────────────
@@ -267,20 +340,42 @@ def _load_training_history():
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
 
+    st.markdown("**Data Source**")
+    data_source = st.selectbox("Source", ["Simulation", "Serial LiDAR"],
+                               index=0)
+    serial_port = None
+    serial_baud = 115200
+    if data_source == "Serial LiDAR":
+        serial_port = st.text_input("Serial port", value="/dev/ttyUSB0",
+                                    placeholder="COM3 or /dev/ttyUSB0")
+        serial_baud = st.number_input("Baud rate", value=115200, step=9600)
+
+    st.markdown("**Vehicle / Sensor**")
+    vehicle_speed = st.slider("Vehicle speed (km/h)", 1, 120, 30, step=1,
+                              help="Used to estimate pothole width/length")
+    sample_rate   = st.slider("LiDAR sample rate (Hz)", 1, 100, 10, step=1,
+                              help="How many readings per second")
+
     st.markdown("**Adaptive Baseline**")
-    ma_window    = st.slider("MA window (readings)",  10, 60,
-                             ADAPT_MA_WINDOW, step=5)
+    calibration_n = st.slider("Calibration readings",  10, 50, 20, step=5,
+                              help="First N readings build the baseline")
+    ma_window    = calibration_n     # MA window = calibration count
     min_dur      = st.slider("Min duration (readings)", 1, 10,
                              ADAPT_MIN_DURATION, step=1)
 
-    st.markdown("**Model**")
-    model_ok     = os.path.exists(MODEL_SAVE_PATH)
-    use_model    = st.checkbox("Use LSTM model", value=model_ok)
+    st.markdown("**Model (Disabled by Request)**")
+    # model_ok     = os.path.exists(MODEL_SAVE_PATH)
+    # use_model    = st.checkbox("Use LSTM model", value=model_ok)
+    model_ok = False
+    use_model = False
     conf_thresh  = st.slider("Min confidence",        0.3, 0.95,
                              RT_CONFIDENCE_THRESHOLD,  step=0.05)
     alert_depth  = st.slider("Alert depth (cm)",      1.0, 40.0,
                              RT_ALERT_DEPTH_CM,        step=0.5)
-    steps_per_click = st.slider("Readings per step",  1, 50, 10)
+    steps_per_click = st.slider("Readings per batch",  1, 50, 2)
+    stream_speed    = st.slider("Stream speed (ms between batches)",
+                                10, 2000, 50, step=10,
+                                help="Lower → faster updates when streaming")
 
     st.divider()
     st.markdown("## 🚦 Class Legend")
@@ -310,110 +405,191 @@ st.markdown("""
 
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_live, tab_log, tab_stats = st.tabs(
-    ["📡 Live Detection", "📋 Detection Log", "📊 Model Stats"]
+tab_live, tab_events, tab_log, tab_stats = st.tabs(
+    ["📡 Live Detection", "🕳️ Pothole Events", "📋 Detection Log", "📊 Model Stats"]
 )
 
 
+# ── Serial reader helper ────────────────────────────────────────────────────
+def _read_serial_batch(port: str, baud: int, n: int) -> list[tuple[float, float]]:
+    """
+    Read up to `n` distance/strength pairs from a TFMini-style serial LiDAR.
+    CRITICAL PI FIX: Drains the entire OS serial buffer first to ensure zero latency.
+    """
+    try:
+        import serial
+    except ImportError:
+        st.error("PySerial is required for serial mode: `pip install pyserial`")
+        return []
+        
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+    except Exception as e:
+        st.error(f"Cannot open serial port **{port}**: {e}")
+        return []
+        
+    pairs: list[tuple[float, float]] = []
+    
+    try:
+        # 1. Drain the massive backlog of stale data that built up while Streamlit slept
+        waiting = ser.in_waiting
+        if waiting > 100:
+            ser.read(waiting - 36)  # Flush most of it, leave enough for a few fresh frames
+            
+        # 2. Read fresh frames
+        buf = ser.read(100)
+        
+        # 3. Parse backwards or collect the first N complete frames we find
+        while len(pairs) < n and len(buf) >= 9:
+            if buf[0] == 0x59 and buf[1] == 0x59:
+                dist = float(buf[3] << 8 | buf[2])
+                strn = float(buf[5] << 8 | buf[4])
+                
+                # Sanity check distance max ranges before appending
+                if 1 <= dist <= 2200:
+                    pairs.append((dist, strn))
+                buf = buf[9:]
+            else:
+                buf = buf[1:]
+    finally:
+        ser.close()
+        
+    return pairs
+
+
 # ╔═══════════════════════════════════════════════════════╗
-# ║  TAB 1 — Live Detection                               ║
+# ║  TAB 1 — Live Detection  (fully continuous)           ║
 # ╚═══════════════════════════════════════════════════════╝
 with tab_live:
-    if not model_ok:
-        st.warning("⚠️ Train the model first: `cd DL_Model && python train.py`")
+    total    = st.session_state["total"]
+    cal_done = total >= calibration_n       # baseline calibration finished?
+
+    # ── Status bar + Reset ───────────────────────────────────────────────
+    col_st, col_rst = st.columns([4, 1])
+    with col_rst:
+        reset_btn = st.button("🔄 Recalibrate", use_container_width=True)
+    with col_st:
+        if not cal_done:
+            pct = min(total / calibration_n, 1.0)
+            st.progress(pct,
+                        text=f"📡 Calibrating baseline … {total}/{calibration_n} readings")
+        else:
+            st.markdown(
+                '<span style="color:#2ea043;font-weight:700;font-size:16px;">'
+                f'🟢 LIVE — Baseline locked ({calibration_n} readings)  |  '
+                f'Total: {total} readings</span>', unsafe_allow_html=True)
+
+    # ── Reset / Recalibrate ──────────────────────────────────────────────
+    if reset_btn:
+        st.session_state["readings"]  = []
+        st.session_state["strengths"] = []
+        st.session_state["baselines"] = []
+        st.session_state["results"]   = []
+        st.session_state["alerts"]    = []
+        st.session_state["events"]    = []
+        st.session_state["total"]     = 0
+        st.session_state["running"]   = True
+        st.cache_resource.clear()
+        st.rerun()
+
+    # ── Always process a batch (continuous) ──────────────────────────────
+    detector = _get_detector(conf_thresh, alert_depth,
+                             ma_window, min_dur,
+                             use_model and model_ok)
+
+    # Get readings from the selected source
+    if data_source == "Serial LiDAR" and serial_port:
+        pairs = _read_serial_batch(serial_port, serial_baud,
+                                   steps_per_click)
     else:
-        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 3])
-        with col_ctrl1:
-            step_btn = st.button("▶ Step", use_container_width=True)
-        with col_ctrl2:
-            reset_btn = st.button("🔄 Reset", use_container_width=True)
+        pairs = [_next_sim_reading(detector.baseline)
+                 for _ in range(steps_per_click)]
 
-        if reset_btn:
-            st.session_state["readings"] = []
-            st.session_state["strengths"] = []
-            st.session_state["baselines"] = []
-            st.session_state["results"]   = []
-            st.session_state["alerts"]    = []
-            st.session_state["total"]     = 0
-            st.cache_resource.clear()
-            st.rerun()
+    for dist, strn in pairs:
+        st.session_state["readings"].append(dist)
+        st.session_state["strengths"].append(strn)
+        st.session_state["baselines"].append(detector.baseline)
+        st.session_state["total"] += 1
+        result = detector.feed(dist, strn)
+        if result:
+            st.session_state["results"].append(result)
+            if result["alert"]:
+                st.session_state["alerts"].append(result)
 
-        if step_btn:
-            detector = _get_detector(conf_thresh, alert_depth,
-                                     ma_window, min_dur,
-                                     use_model and model_ok)
-            for _ in range(steps_per_click):
-                dist, strn = _next_sim_reading(detector.baseline)
-                st.session_state["readings"].append(dist)
-                st.session_state["strengths"].append(strn)
-                st.session_state["baselines"].append(detector.baseline)
-                st.session_state["total"] += 1
-                result = detector.feed(dist, strn)
-                if result:
-                    st.session_state["results"].append(result)
-                    if result["alert"]:
-                        st.session_state["alerts"].append(result)
+    # Keep only the last 500 entries to avoid memory bloat
+    for key in ("readings", "strengths", "baselines"):
+        st.session_state[key] = st.session_state[key][-500:]
+    st.session_state["results"] = st.session_state["results"][-500:]
 
-            for key in ("readings", "strengths", "baselines"):
-                st.session_state[key] = st.session_state[key][-500:]
-            st.session_state["results"] = st.session_state["results"][-500:]
+    # ── Extract pothole/bump events ──────────────────────────────────
+    st.session_state["events"] = _extract_events(
+        st.session_state["results"], vehicle_speed, sample_rate
+    )
 
-        # ── KPIs ────────────────────────────────────────────────────────────
-        results = st.session_state["results"]
-        latest  = results[-1] if results else None
+    # Refresh total after processing
+    total    = st.session_state["total"]
+    cal_done = total >= calibration_n
 
+    # ── KPIs (only show after calibration) ──────────────────────────────
+    results = st.session_state["results"]
+    latest  = results[-1] if results else None
+    events  = st.session_state["events"]
+
+    if cal_done and latest:
         k1, k2, k3, k4 = st.columns(4)
         with k1:
-            class_name = latest["class_name"] if latest else "—"
-            cls_id     = latest["class_id"]   if latest else -1
+            class_name = latest["class_name"]
+            cls_id     = latest["class_id"]
             col        = CLASS_COLORS.get(cls_id, "#8b949e")
             st.markdown(f"""<div class="metric-card">
               <h3>Current Class</h3>
               <p class="val" style="color:{col};">{class_name}</p>
-              <p class="sub">{'⚠️ ALERT' if (latest and latest['alert']) else 'OK'}</p>
+              <p class="sub">{'⚠️ ALERT' if latest['alert'] else 'OK'}</p>
             </div>""", unsafe_allow_html=True)
         with k2:
-            depth = f"{latest['depth_cm']:.1f} cm" if latest else "—"
             st.markdown(f"""<div class="metric-card">
               <h3>Depth</h3>
-              <p class="val">{depth}</p>
-              <p class="sub">{latest['severity'] if latest else ''}</p>
+              <p class="val">{latest['depth_cm']:.1f} cm</p>
+              <p class="sub">{latest['severity']}</p>
             </div>""", unsafe_allow_html=True)
         with k3:
-            conf = f"{latest['confidence']*100:.1f}%" if latest else "—"
             st.markdown(f"""<div class="metric-card">
               <h3>Confidence</h3>
-              <p class="val">{conf}</p>
-              <p class="sub">Model certainty</p>
+              <p class="val">{latest['confidence']*100:.1f}%</p>
+              <p class="sub">{'DL Model' if use_model and model_ok else 'Rule-Based'}</p>
             </div>""", unsafe_allow_html=True)
         with k4:
             n_alerts = len(st.session_state["alerts"])
             st.markdown(f"""<div class="metric-card">
               <h3>Total Alerts</h3>
               <p class="val" style="color:#f85149;">{n_alerts}</p>
-              <p class="sub">of {st.session_state['total']} readings</p>
+              <p class="sub">Baseline: {latest['baseline_cm']:.1f} cm</p>
             </div>""", unsafe_allow_html=True)
+    elif not cal_done:
+        st.info(f"⏳ Calibrating … collecting {calibration_n} readings "
+                "to establish the baseline distance. Detection will start automatically.")
 
-        # Alert banner
-        if latest and latest["alert"]:
-            st.markdown(
-                f'<div class="alert-box">⚠️  POTHOLE DETECTED! '
-                f'Depth: {latest["depth_cm"]:.1f} cm  |  '
-                f'{latest["severity"]}  |  '
-                f'Conf: {latest["confidence"]*100:.1f}%</div>',
-                unsafe_allow_html=True
-            )
-
-        # Distance + deviation plot
-        st.plotly_chart(
-            _distance_plot(
-                st.session_state["readings"],
-                st.session_state.get("baselines", []),
-                st.session_state["results"],
-            ),
-            use_container_width=True, key="dist_plot"
+    # Alert banner
+    if cal_done and latest and latest["alert"]:
+        st.markdown(
+            f'<div class="alert-box">⚠️  {latest["class_name"].upper()} DETECTED! '
+            f'Depth/Height: {latest["depth_cm"]:.1f} cm  |  '
+            f'{latest["severity"]}  |  '
+            f'Conf: {latest["confidence"]*100:.1f}%</div>',
+            unsafe_allow_html=True
         )
 
+    # Distance + deviation plot (always show — even during calibration)
+    st.plotly_chart(
+        _distance_plot(
+            st.session_state["readings"],
+            st.session_state.get("baselines", []),
+            st.session_state["results"],
+        ),
+        use_container_width=True, key="dist_plot"
+    )
+
+    if cal_done:
         # Confidence breakdown
         if latest and latest.get("probs"):
             st.markdown("#### Class Probability Breakdown")
@@ -436,14 +612,167 @@ with tab_live:
             i4.metric("MA Deviation",
                       f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
 
+        # ── Latest event info ────────────────────────────────────────────
+        if events:
+            st.markdown("#### 🕳️ Latest Detected Event")
+            ev = events[-1]
+            ev_type_col = CLASS_COLORS.get(ev["type_id"], "#8b949e")
+            e1, e2, e3, e4, e5 = st.columns(5)
+            with e1:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Type</h3>
+                  <p class="val" style="color:{ev_type_col};">{ev['type']}</p>
+                  <p class="sub">{ev['severity']}</p>
+                </div>""", unsafe_allow_html=True)
+            with e2:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Max Depth</h3>
+                  <p class="val">{ev['max_depth_cm']} cm</p>
+                  <p class="sub">Avg: {ev['avg_depth_cm']} cm</p>
+                </div>""", unsafe_allow_html=True)
+            with e3:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Length | Width</h3>
+                  <p class="val">{ev['length_cm']} cm</p>
+                  <p class="sub">W: Unk (1D Sensor)</p>
+                </div>""", unsafe_allow_html=True)
+            with e4:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Duration</h3>
+                  <p class="val">{ev['n_readings']} rdgs</p>
+                  <p class="sub">{ev['n_readings'] / max(sample_rate, 1):.2f} sec</p>
+                </div>""", unsafe_allow_html=True)
+            with e5:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Total Events</h3>
+                  <p class="val" style="color:#f85149;">{len(events)}</p>
+                  <p class="sub">Potholes + Bumps</p>
+                </div>""", unsafe_allow_html=True)
+
+    # ── Auto-rerun for continuous streaming ───────────────────────────
+    time.sleep(stream_speed / 1000.0)
+    st.rerun()
+
 
 # ╔═══════════════════════════════════════════════════════╗
-# ║  TAB 2 — Detection Log                                ║
+# ║  TAB 2 — Pothole Events                               ║
+# ╚═══════════════════════════════════════════════════════╝
+with tab_events:
+    ev_list = st.session_state["events"]
+    if not ev_list:
+        st.info("No pothole or speed-bump events detected yet. "
+                "Events will appear automatically once the system detects anomalies.")
+    else:
+        # Summary KPIs
+        n_potholes = sum(1 for e in ev_list if e["type_id"] in (1, 2))
+        n_bumps    = sum(1 for e in ev_list if e["type_id"] == 3)
+        deepest    = max(e["max_depth_cm"] for e in ev_list)
+        longest     = max(e["length_cm"] for e in ev_list)
+
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Potholes Found</h3>
+              <p class="val" style="color:#f85149;">{n_potholes}</p>
+            </div>""", unsafe_allow_html=True)
+        with s2:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Speed Bumps</h3>
+              <p class="val" style="color:#58a6ff;">{n_bumps}</p>
+            </div>""", unsafe_allow_html=True)
+        with s3:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Deepest</h3>
+              <p class="val">{deepest} cm</p>
+            </div>""", unsafe_allow_html=True)
+        with s4:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Longest Event</h3>
+              <p class="val">{longest} cm</p>
+              <p class="sub">{longest / 100:.2f} m</p>
+            </div>""", unsafe_allow_html=True)
+
+        # Detailed events table
+        st.markdown("#### Detected Events")
+        ev_df = pd.DataFrame([{
+            "#"            : e["event_id"],
+            "Type"         : e["type"],
+            "Severity"     : e["severity"],
+            "Max Depth (cm)": e["max_depth_cm"],
+            "Avg Depth (cm)": e["avg_depth_cm"],
+            "Length (cm)"  : e["length_cm"],
+            "Width (cm)"   : "Unk (1D)",
+            "Duration (rdgs)": e["n_readings"],
+            "Conf (%)"     : round(e["confidence"] * 100, 1),
+        } for e in ev_list])
+
+        st.dataframe(ev_df, use_container_width=True, height=350)
+
+        # Depth vs Length scatter
+        st.markdown("#### Depth vs Length")
+        sc_df = pd.DataFrame([{
+            "Max Depth (cm)": e["max_depth_cm"],
+            "Length (cm)"   : e["length_cm"],
+            "Type"          : e["type"],
+            "Severity"      : e["severity"],
+        } for e in ev_list])
+        fig_sc = px.scatter(
+            sc_df, x="Length (cm)", y="Max Depth (cm)",
+            color="Type",
+            size="Max Depth (cm)",
+            color_discrete_map={
+                CLASS_NAMES[1]: CLASS_COLORS[1],
+                CLASS_NAMES[2]: CLASS_COLORS[2],
+                CLASS_NAMES[3]: CLASS_COLORS[3],
+            },
+            hover_data=["Severity"],
+        )
+        fig_sc.update_layout(
+            paper_bgcolor=DARK_BG, plot_bgcolor=CARD_BG,
+            font=dict(color="#8b949e"),
+            height=350, margin=dict(l=50, r=20, t=30, b=30),
+        )
+        for ax in ["xaxis", "yaxis"]:
+            getattr(fig_sc.layout, ax).update(gridcolor=GRID_COL)
+        st.plotly_chart(fig_sc, use_container_width=True, key="ev_scatter")
+
+        # Event type pie
+        c1_ev, c2_ev = st.columns(2)
+        with c1_ev:
+            type_counts = sc_df["Type"].value_counts().reset_index()
+            type_counts.columns = ["Type", "Count"]
+            fig_tp = px.pie(type_counts, values="Count", names="Type",
+                           color_discrete_sequence=[
+                               "#f0e030", "#f85149", "#58a6ff"],
+                           hole=0.45)
+            fig_tp.update_layout(
+                paper_bgcolor=DARK_BG, font=dict(color="#8b949e"),
+                margin=dict(l=10, r=10, t=30, b=10),
+                title=dict(text="Event Types", font=dict(color="white")),
+            )
+            st.plotly_chart(fig_tp, use_container_width=True, key="ev_type_pie")
+        with c2_ev:
+            sev_counts = sc_df["Severity"].value_counts().reset_index()
+            sev_counts.columns = ["Severity", "Count"]
+            fig_sv = px.pie(sev_counts, values="Count", names="Severity",
+                           color_discrete_sequence=[
+                               "#2ea043", "#f0e030", "#f85149", "#8b949e"],
+                           hole=0.45)
+            fig_sv.update_layout(
+                paper_bgcolor=DARK_BG, font=dict(color="#8b949e"),
+                margin=dict(l=10, r=10, t=30, b=10),
+                title=dict(text="Severity Distribution", font=dict(color="white")),
+            )
+            st.plotly_chart(fig_sv, use_container_width=True, key="ev_sev_pie")
+
+
+# ╔═══════════════════════════════════════════════════════╗
+# ║  TAB 3 — Detection Log                                ║
 # ╚═══════════════════════════════════════════════════════╝
 with tab_log:
     results = st.session_state["results"]
     if not results:
-        st.info("No detections yet. Click ▶ Step in the Live Detection tab.")
+        st.info("No detections yet. Click ▶ Start in the Live Detection tab.")
     else:
         df = pd.DataFrame([{
             "Class"       : r["class_name"],
