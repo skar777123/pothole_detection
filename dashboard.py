@@ -148,7 +148,8 @@ with st.sidebar:
     speed_kmph = st.number_input("Speed (km/h)", 5, 120, 30, step=5)
 
     st.markdown("---")
-    if st.button("🔄 Reset All"):
+    if st.button("🔄 Reset All (and Stop Sensor)"):
+        close_global_lidar()
         for k, v in _defaults.items():
             st.session_state[k] = v
         st.rerun()
@@ -242,21 +243,52 @@ def show_diagnostic():
                 st.error(f"❌ {exc}")
 
 
+# ── Global LiDAR Connection Pool ──────────────────────────────────────────────
+# Streamlit clears session_state on page refresh. To prevent zombie daemon threads
+# from permanently locking the COM port, we use a true process-global cache.
+import sys
+if "LIDAR_HOLDER" not in sys.modules:
+    sys.modules["LIDAR_HOLDER"] = {}
+
+def get_or_create_lidar(port, baud, send_init):
+    holder = sys.modules["LIDAR_HOLDER"]
+    
+    # If a connection exists but for a different port/baud, close it first
+    if "lidar" in holder:
+        old_l = holder["lidar"]
+        if old_l.port != port or old_l.baudrate != baud:
+            close_global_lidar()
+        elif holder["lidar"].connected:
+            return holder["lidar"], holder["reader"]
+
+    # Create new connection
+    lidar = TF02Pro(port=port, baudrate=baud, send_init=send_init)
+    reader = LiDARReaderThread(lidar, maxlen=5)
+    holder["lidar"] = lidar
+    holder["reader"] = reader
+    return lidar, reader
+
+def close_global_lidar():
+    holder = sys.modules["LIDAR_HOLDER"]
+    if "reader" in holder:
+        try: holder["reader"].stop()
+        except Exception: pass
+    if "lidar" in holder:
+        try: holder["lidar"].close()
+        except Exception: pass
+    holder.clear()
+
 # ── Main detection loop ───────────────────────────────────────────────────────
 
 def run_detection(model):
     # ── Open LiDAR ───────────────────────────────────────────────────────────
     try:
-        lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
-                        send_init=send_init)
+        lidar, reader = get_or_create_lidar(lidar_port, lidar_baud, send_init)
     except Exception as exc:
         st.error(f"❌ Cannot open `{lidar_port}`: {exc}")
         st.session_state.running = False
         show_diagnostic()
         return
-
-    # Start background reader thread
-    reader = LiDARReaderThread(lidar, maxlen=5)
 
     # ── UI layout ─────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
@@ -500,9 +532,14 @@ def run_detection(model):
             time.sleep(0.02)   # 50 Hz poll rate — very fast, UI still only at 10 Hz
 
     finally:
-        # ── Cleanup (Guaranteed to run even if Streamlit interrupts) ─────────
-        reader.stop()
-        lidar.close()
+        # ── Cleanup ────────────────────────────────────────────────────────
+        # Do NOT close the global port here, because Streamlit 'RerunException' 
+        # hits this when you click a slider. The port stays open in the background!
+        pass
+        
+    # Only close if user explicitly clicked the Stop button
+    if stop_btn:
+        close_global_lidar()
         st.session_state.running = False
         st.info("⏹ Stopped.")
 
