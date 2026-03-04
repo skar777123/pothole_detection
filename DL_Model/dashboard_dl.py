@@ -268,6 +268,16 @@ def _load_training_history():
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
 
+    st.markdown("**Data Source**")
+    data_source = st.selectbox("Source", ["Simulation", "Serial LiDAR"],
+                               index=0)
+    serial_port = None
+    serial_baud = 115200
+    if data_source == "Serial LiDAR":
+        serial_port = st.text_input("Serial port", value="/dev/ttyUSB0",
+                                    placeholder="COM3 or /dev/ttyUSB0")
+        serial_baud = st.number_input("Baud rate", value=115200, step=9600)
+
     st.markdown("**Adaptive Baseline**")
     ma_window    = st.slider("MA window (readings)",  10, 60,
                              ADAPT_MA_WINDOW, step=5)
@@ -281,7 +291,10 @@ with st.sidebar:
                              RT_CONFIDENCE_THRESHOLD,  step=0.05)
     alert_depth  = st.slider("Alert depth (cm)",      1.0, 40.0,
                              RT_ALERT_DEPTH_CM,        step=0.5)
-    steps_per_click = st.slider("Readings per step",  1, 50, 10)
+    steps_per_click = st.slider("Readings per batch",  1, 50, 10)
+    stream_speed    = st.slider("Stream speed (ms between batches)",
+                                50, 2000, 200, step=50,
+                                help="Lower → faster updates when streaming")
 
     st.divider()
     st.markdown("## 🚦 Class Legend")
@@ -316,126 +329,202 @@ tab_live, tab_log, tab_stats = st.tabs(
 )
 
 
+# ── Serial reader helper ────────────────────────────────────────────────────
+def _read_serial_batch(port: str, baud: int, n: int) -> list[tuple[float, float]]:
+    """Read up to `n` distance/strength pairs from a TFMini-style serial LiDAR."""
+    try:
+        import serial
+    except ImportError:
+        st.error("PySerial is required for serial mode: `pip install pyserial`")
+        return []
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+    except Exception as e:
+        st.error(f"Cannot open serial port **{port}**: {e}")
+        return []
+    pairs: list[tuple[float, float]] = []
+    buf = b""
+    deadline = time.time() + 2.0          # max 2 s per batch
+    try:
+        while len(pairs) < n and time.time() < deadline:
+            chunk = ser.read(max(1, ser.in_waiting))
+            if not chunk:
+                continue
+            buf += chunk
+            while len(buf) >= 9:
+                if buf[0] == 0x59 and buf[1] == 0x59:
+                    dist = float(buf[3] << 8 | buf[2])
+                    strn = float(buf[5] << 8 | buf[4])
+                    pairs.append((dist, strn))
+                    buf = buf[9:]
+                else:
+                    buf = buf[1:]
+    finally:
+        ser.close()
+    return pairs
+
+
 # ╔═══════════════════════════════════════════════════════╗
 # ║  TAB 1 — Live Detection                               ║
 # ╚═══════════════════════════════════════════════════════╝
 with tab_live:
-    if not model_ok:
-        st.warning("⚠️ Train the model first: `cd DL_Model && python train.py`")
-    else:
-        col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 3])
-        with col_ctrl1:
-            step_btn = st.button("▶ Step", use_container_width=True)
-        with col_ctrl2:
-            reset_btn = st.button("🔄 Reset", use_container_width=True)
-
-        if reset_btn:
-            st.session_state["readings"] = []
-            st.session_state["strengths"] = []
-            st.session_state["baselines"] = []
-            st.session_state["results"]   = []
-            st.session_state["alerts"]    = []
-            st.session_state["total"]     = 0
-            st.cache_resource.clear()
-            st.rerun()
-
-        if step_btn:
-            detector = _get_detector(conf_thresh, alert_depth,
-                                     ma_window, min_dur,
-                                     use_model and model_ok)
-            for _ in range(steps_per_click):
-                dist, strn = _next_sim_reading(detector.baseline)
-                st.session_state["readings"].append(dist)
-                st.session_state["strengths"].append(strn)
-                st.session_state["baselines"].append(detector.baseline)
-                st.session_state["total"] += 1
-                result = detector.feed(dist, strn)
-                if result:
-                    st.session_state["results"].append(result)
-                    if result["alert"]:
-                        st.session_state["alerts"].append(result)
-
-            for key in ("readings", "strengths", "baselines"):
-                st.session_state[key] = st.session_state[key][-500:]
-            st.session_state["results"] = st.session_state["results"][-500:]
-
-        # ── KPIs ────────────────────────────────────────────────────────────
-        results = st.session_state["results"]
-        latest  = results[-1] if results else None
-
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            class_name = latest["class_name"] if latest else "—"
-            cls_id     = latest["class_id"]   if latest else -1
-            col        = CLASS_COLORS.get(cls_id, "#8b949e")
-            st.markdown(f"""<div class="metric-card">
-              <h3>Current Class</h3>
-              <p class="val" style="color:{col};">{class_name}</p>
-              <p class="sub">{'⚠️ ALERT' if (latest and latest['alert']) else 'OK'}</p>
-            </div>""", unsafe_allow_html=True)
-        with k2:
-            depth = f"{latest['depth_cm']:.1f} cm" if latest else "—"
-            st.markdown(f"""<div class="metric-card">
-              <h3>Depth</h3>
-              <p class="val">{depth}</p>
-              <p class="sub">{latest['severity'] if latest else ''}</p>
-            </div>""", unsafe_allow_html=True)
-        with k3:
-            conf = f"{latest['confidence']*100:.1f}%" if latest else "—"
-            st.markdown(f"""<div class="metric-card">
-              <h3>Confidence</h3>
-              <p class="val">{conf}</p>
-              <p class="sub">Model certainty</p>
-            </div>""", unsafe_allow_html=True)
-        with k4:
-            n_alerts = len(st.session_state["alerts"])
-            st.markdown(f"""<div class="metric-card">
-              <h3>Total Alerts</h3>
-              <p class="val" style="color:#f85149;">{n_alerts}</p>
-              <p class="sub">of {st.session_state['total']} readings</p>
-            </div>""", unsafe_allow_html=True)
-
-        # Alert banner
-        if latest and latest["alert"]:
+    # ── Control buttons ──────────────────────────────────────────────────
+    col_c1, col_c2, col_c3, col_c4 = st.columns([1, 1, 1, 2])
+    with col_c1:
+        if st.session_state["running"]:
+            stop_btn = st.button("⏹ Stop", use_container_width=True,
+                                 type="primary")
+            if stop_btn:
+                st.session_state["running"] = False
+                st.rerun()
+        else:
+            start_btn = st.button("▶ Start", use_container_width=True,
+                                  type="primary")
+            if start_btn:
+                st.session_state["running"] = True
+                st.rerun()
+    with col_c2:
+        step_btn = st.button("⏭ Step", use_container_width=True,
+                             disabled=st.session_state["running"])
+    with col_c3:
+        reset_btn = st.button("🔄 Reset", use_container_width=True)
+    with col_c4:
+        if st.session_state["running"]:
             st.markdown(
-                f'<div class="alert-box">⚠️  POTHOLE DETECTED! '
-                f'Depth: {latest["depth_cm"]:.1f} cm  |  '
-                f'{latest["severity"]}  |  '
-                f'Conf: {latest["confidence"]*100:.1f}%</div>',
-                unsafe_allow_html=True
-            )
+                '<span style="color:#2ea043;font-weight:700;font-size:16px;">'
+                '🟢 STREAMING …</span>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<span style="color:#8b949e;font-size:16px;">'
+                '⏸ Paused — click <b>▶ Start</b></span>',
+                unsafe_allow_html=True)
 
-        # Distance + deviation plot
-        st.plotly_chart(
-            _distance_plot(
-                st.session_state["readings"],
-                st.session_state.get("baselines", []),
-                st.session_state["results"],
-            ),
-            use_container_width=True, key="dist_plot"
+    # ── Reset handler ────────────────────────────────────────────────────
+    if reset_btn:
+        st.session_state["readings"]  = []
+        st.session_state["strengths"] = []
+        st.session_state["baselines"] = []
+        st.session_state["results"]   = []
+        st.session_state["alerts"]    = []
+        st.session_state["total"]     = 0
+        st.session_state["running"]   = False
+        st.cache_resource.clear()
+        st.rerun()
+
+    # ── Process one batch (shared by Step and continuous mode) ───────
+    should_process = step_btn or st.session_state["running"]
+
+    if should_process:
+        detector = _get_detector(conf_thresh, alert_depth,
+                                 ma_window, min_dur,
+                                 use_model and model_ok)
+
+        # Get readings from the selected source
+        if data_source == "Serial LiDAR" and serial_port:
+            pairs = _read_serial_batch(serial_port, serial_baud,
+                                       steps_per_click)
+        else:
+            pairs = [_next_sim_reading(detector.baseline)
+                     for _ in range(steps_per_click)]
+
+        for dist, strn in pairs:
+            st.session_state["readings"].append(dist)
+            st.session_state["strengths"].append(strn)
+            st.session_state["baselines"].append(detector.baseline)
+            st.session_state["total"] += 1
+            result = detector.feed(dist, strn)
+            if result:
+                st.session_state["results"].append(result)
+                if result["alert"]:
+                    st.session_state["alerts"].append(result)
+
+        # Keep only the last 500 entries to avoid memory bloat
+        for key in ("readings", "strengths", "baselines"):
+            st.session_state[key] = st.session_state[key][-500:]
+        st.session_state["results"] = st.session_state["results"][-500:]
+
+    # ── KPIs ────────────────────────────────────────────────────────────
+    results = st.session_state["results"]
+    latest  = results[-1] if results else None
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        class_name = latest["class_name"] if latest else "—"
+        cls_id     = latest["class_id"]   if latest else -1
+        col        = CLASS_COLORS.get(cls_id, "#8b949e")
+        st.markdown(f"""<div class="metric-card">
+          <h3>Current Class</h3>
+          <p class="val" style="color:{col};">{class_name}</p>
+          <p class="sub">{'⚠️ ALERT' if (latest and latest['alert']) else 'OK'}</p>
+        </div>""", unsafe_allow_html=True)
+    with k2:
+        depth = f"{latest['depth_cm']:.1f} cm" if latest else "—"
+        st.markdown(f"""<div class="metric-card">
+          <h3>Depth</h3>
+          <p class="val">{depth}</p>
+          <p class="sub">{latest['severity'] if latest else ''}</p>
+        </div>""", unsafe_allow_html=True)
+    with k3:
+        conf = f"{latest['confidence']*100:.1f}%" if latest else "—"
+        st.markdown(f"""<div class="metric-card">
+          <h3>Confidence</h3>
+          <p class="val">{conf}</p>
+          <p class="sub">Model certainty</p>
+        </div>""", unsafe_allow_html=True)
+    with k4:
+        n_alerts = len(st.session_state["alerts"])
+        st.markdown(f"""<div class="metric-card">
+          <h3>Total Alerts</h3>
+          <p class="val" style="color:#f85149;">{n_alerts}</p>
+          <p class="sub">of {st.session_state['total']} readings</p>
+        </div>""", unsafe_allow_html=True)
+
+    # Alert banner
+    if latest and latest["alert"]:
+        st.markdown(
+            f'<div class="alert-box">⚠️  POTHOLE DETECTED! '
+            f'Depth: {latest["depth_cm"]:.1f} cm  |  '
+            f'{latest["severity"]}  |  '
+            f'Conf: {latest["confidence"]*100:.1f}%</div>',
+            unsafe_allow_html=True
         )
 
-        # Confidence breakdown
-        if latest and latest.get("probs"):
-            st.markdown("#### Class Probability Breakdown")
-            st.plotly_chart(_confidence_fig(latest),
-                            use_container_width=True, key="conf_plot")
+    # Distance + deviation plot
+    st.plotly_chart(
+        _distance_plot(
+            st.session_state["readings"],
+            st.session_state.get("baselines", []),
+            st.session_state["results"],
+        ),
+        use_container_width=True, key="dist_plot"
+    )
 
-        # Extra adaptive info row
-        if latest:
-            i1, i2, i3, i4 = st.columns(4)
-            vel  = latest.get("velocity_cm", 0)
-            run  = latest.get("duration_run", 0)
-            vp   = latest.get("vel_pattern", False)
-            conf_dur = latest.get("duration_confirmed", False)
-            i1.metric("Velocity (cm/reading)", f"{vel:+.2f}")
-            i2.metric("Duration Run",
-                      f"{run} / {min_dur} rdgs",
-                      delta="Confirmed!" if conf_dur else None,
-                      delta_color="normal" if conf_dur else "off")
-            i3.metric("Vel Pattern", "↗↘ Yes" if vp else "—")
-            i4.metric("MA Deviation",
-                      f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
+    # Confidence breakdown
+    if latest and latest.get("probs"):
+        st.markdown("#### Class Probability Breakdown")
+        st.plotly_chart(_confidence_fig(latest),
+                        use_container_width=True, key="conf_plot")
+
+    # Extra adaptive info row
+    if latest:
+        i1, i2, i3, i4 = st.columns(4)
+        vel  = latest.get("velocity_cm", 0)
+        run  = latest.get("duration_run", 0)
+        vp   = latest.get("vel_pattern", False)
+        conf_dur = latest.get("duration_confirmed", False)
+        i1.metric("Velocity (cm/reading)", f"{vel:+.2f}")
+        i2.metric("Duration Run",
+                  f"{run} / {min_dur} rdgs",
+                  delta="Confirmed!" if conf_dur else None,
+                  delta_color="normal" if conf_dur else "off")
+        i3.metric("Vel Pattern", "↗↘ Yes" if vp else "—")
+        i4.metric("MA Deviation",
+                  f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
+
+    # ── Auto-rerun for continuous streaming ───────────────────────────
+    if st.session_state["running"]:
+        time.sleep(stream_speed / 1000.0)
+        st.rerun()
 
 
 # ╔═══════════════════════════════════════════════════════╗
