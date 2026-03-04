@@ -375,6 +375,7 @@ class AdaptiveDetector:
     def __init__(self,
                  use_model: bool = True,
                  ma_window: int = ADAPT_MA_WINDOW,
+                 hp_alpha: float = ADAPT_HP_ALPHA,
                  min_duration: int = ADAPT_MIN_DURATION,
                  confidence_threshold: float = RT_CONFIDENCE_THRESHOLD,
                  alert_depth_cm: float = RT_ALERT_DEPTH_CM):
