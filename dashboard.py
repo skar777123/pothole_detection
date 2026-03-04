@@ -297,214 +297,216 @@ def run_detection(model):
     logger.info("Detection started (background thread). Baseline=%.1f cm",
                 st.session_state.baseline_cm)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    while not stop_btn:
+    try:
+        # ── Main loop ─────────────────────────────────────────────────────────────
+        while not stop_btn:
 
-        # ── GET LATEST FRAME from background thread (instant, no serial I/O) ──
-        frame = reader.get_latest()
+            # ── GET LATEST FRAME from background thread (instant, no serial I/O) ──
+            frame = reader.get_latest()
 
-        if frame is None:
-            no_data_count += 1
-            # Show retry status — keep trying indefinitely (don't stop)
-            status_ph.warning(
-                f"⏳ Waiting for sensor frames …  "
-                f"Poll #{no_data_count} | Thread errors: {reader.errors} | "
-                f"Thread frames: {reader.frames}  \n\n"
-                f"{'🔴 Sensor silent — check USB connection & power' if reader.errors > 10 else '🟡 Starting up …'}"
-            )
-            time.sleep(0.05)
-            continue
-
-        no_data_count = 0
-        dist     = frame["distance_cm"]
-        strength = frame["strength"]
-        temp     = frame["temperature_c"]
-        valid    = frame.get("valid", True)
-
-        # Skip out-of-range readings — show warning, don't affect detection
-        if not valid:
-            status_ph.warning(
-                f"⚠️ Reading out of range: **{dist} cm** "
-                f"(valid range 1–2200 cm) — skipping frame"
-            )
-            time.sleep(0.02)
-            continue
-
-        # ── ROLLING BASELINE (mean of last 20 readings) ───────────────────────
-        st.session_state.rolling_baseline_buf.append(dist)
-        if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
-            st.session_state.baseline_cm  = float(
-                np.mean(st.session_state.rolling_baseline_buf)
-            )
-            st.session_state.calibrated = True
-
-        # Skip detection until baseline is fully established
-        if not st.session_state.calibrated:
-            _n = len(st.session_state.rolling_baseline_buf)
-            status_ph.info(
-                f"⏳ Establishing baseline … ({_n}/{BASELINE_WINDOW} readings) "
-                f"| Current dist: **{dist} cm**"
-            )
-            time.sleep(0.02)
-            continue
-
-        baseline = st.session_state.baseline_cm
-        dev      = dist - baseline
-
-        # Update histories
-        st.session_state.dist_history.append(dist)
-        st.session_state.dev_history.append(dev)
-        st.session_state.str_history.append(strength)
-        st.session_state.baseline_hist.append(baseline)
-
-        # Sliding window
-        dist_buf.append(dist)
-        str_buf.append(strength)
-        if len(dist_buf) > WINDOW_SIZE:
-            dist_buf.pop(0)
-            str_buf.pop(0)
-
-        # ── Classify ──────────────────────────────────────────────────────────
-        rule_cls = rule_classify(dist, baseline)
-
-        if len(dist_buf) == WINDOW_SIZE and model is not None:
-            feats   = extract_features(
-                np.array(dist_buf), np.array(str_buf), baseline
-            ).reshape(1, -1)
-            ml_cls  = int(model.predict(feats)[0])
-            ml_conf = float(model.predict_proba(feats)[0][ml_cls])
-            final_cls = ml_cls if ml_conf >= 0.55 else rule_cls
-        else:
-            final_cls = rule_cls
-            ml_conf   = 0.0
-
-        is_ph   = IS_POTHOLE.get(final_cls, False)
-        is_bump = IS_BUMP.get(final_cls, False)
-
-        if is_ph or is_bump:
-            st.session_state.confirm_streak += 1
-        else:
-            st.session_state.confirm_streak = 0
-
-        # ── Confirmed detection ────────────────────────────────────────────────
-        if st.session_state.confirm_streak >= confirm_n:
-            now_t   = time.monotonic()
-            elapsed = now_t - st.session_state.last_detect_t
-
-            if elapsed < cooldown_s:
-                remaining = cooldown_s - elapsed
-                # In cooldown: show warning but don't log
+            if frame is None:
+                no_data_count += 1
+                # Show retry status — keep trying indefinitely (don't stop)
                 status_ph.warning(
-                    f"🟡 **{CLASS_LABELS[final_cls]}** continuing "
-                    f"(cooldown ⏳ {remaining:.1f}s) — "
-                    f"dev: **{dev:+.1f} cm**"
+                    f"⏳ Waiting for sensor frames …  "
+                    f"Poll #{no_data_count} | Thread errors: {reader.errors} | "
+                    f"Thread frames: {reader.frames}  \n\n"
+                    f"{'🔴 Sensor silent — check USB connection & power' if reader.errors > 10 else '🟡 Starting up …'}"
                 )
-                st.session_state.confirm_streak = 0
-            else:
-                # === FIRE ALERT (bypasses UI throttle) ===
-                dims = compute_dimensions(dist_buf, str_buf, baseline)
-                if is_ph:   st.session_state.pothole_count += 1
-                elif is_bump: st.session_state.bump_count  += 1
+                time.sleep(0.05)
+                continue
 
-                st.session_state.confirm_streak  = 0
-                st.session_state.last_detect_t   = now_t
-                st.session_state.last_depth      = dims["depth_cm"]
+            no_data_count = 0
+            dist     = frame["distance_cm"]
+            strength = frame["strength"]
+            temp     = frame["temperature_c"]
+            valid    = frame.get("valid", True)
 
-                half = len(dist_buf) // 2
-                dist_buf[:] = dist_buf[half:]
-                str_buf[:]  = str_buf[half:]
-
-                log_entry = {
-                    "Time"       : time.strftime("%H:%M:%S"),
-                    "Type"       : CLASS_LABELS[final_cls],
-                    "Dev (cm)"   : f"{dev:+.1f}",
-                    "Depth (cm)" : dims["depth_cm"],
-                    "Length (cm)": dims["length_cm"],
-                    "Width (cm)" : dims["width_cm"],
-                    "Severity"   : dims["severity"],
-                    "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
-                    "Strength"   : int(dims["avg_strength"]),
-                    "Baseline"   : f"{baseline:.0f}",
-                }
-                st.session_state.pothole_log.insert(0, log_entry)
-
-                # Alert fires immediately
-                status_ph.error(
-                    f"🔴 **{CLASS_LABELS[final_cls]} CONFIRMED** — "
-                    f"dev: **{dev:+.1f} cm** | "
-                    f"depth: **{dims['depth_cm']} cm** | "
-                    f"{dims['severity']}"
-                )
-                logger.info("DETECTED: %s", log_entry)
-        else:
-            # Live status (throttled below with UI updates)
-            sb    = ("█" * st.session_state.confirm_streak
-                     + "░" * max(0, confirm_n - st.session_state.confirm_streak))
-            dev_s = f"{dev:+.1f}"
-            if final_cls == 0:
-                status_ph.success(
-                    f"🟢 Flat Road — dist: **{dist} cm** | "
-                    f"dev: {dev_s} cm | str: {strength} | temp: {temp}°C"
-                )
-            elif is_ph:
+            # Skip out-of-range readings — show warning, don't affect detection
+            if not valid:
                 status_ph.warning(
-                    f"🟡 {CLASS_LABELS[final_cls]} — "
-                    f"dist: **{dist} cm** | dev: **{dev_s} cm** | "
-                    f"streak [{sb}] {st.session_state.confirm_streak}/{confirm_n}"
+                    f"⚠️ Reading out of range: **{dist} cm** "
+                    f"(valid range 1–2200 cm) — skipping frame"
                 )
-            else:
+                time.sleep(0.02)
+                continue
+
+            # ── ROLLING BASELINE (mean of last 20 readings) ───────────────────────
+            st.session_state.rolling_baseline_buf.append(dist)
+            if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
+                st.session_state.baseline_cm  = float(
+                    np.mean(st.session_state.rolling_baseline_buf)
+                )
+                st.session_state.calibrated = True
+
+            # Skip detection until baseline is fully established
+            if not st.session_state.calibrated:
+                _n = len(st.session_state.rolling_baseline_buf)
                 status_ph.info(
-                    f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm**"
+                    f"⏳ Establishing baseline … ({_n}/{BASELINE_WINDOW} readings) "
+                    f"| Current dist: **{dist} cm**"
+                )
+                time.sleep(0.02)
+                continue
+
+            baseline = st.session_state.baseline_cm
+            dev      = dist - baseline
+
+            # Update histories
+            st.session_state.dist_history.append(dist)
+            st.session_state.dev_history.append(dev)
+            st.session_state.str_history.append(strength)
+            st.session_state.baseline_hist.append(baseline)
+
+            # Sliding window
+            dist_buf.append(dist)
+            str_buf.append(strength)
+            if len(dist_buf) > WINDOW_SIZE:
+                dist_buf.pop(0)
+                str_buf.pop(0)
+
+            # ── Classify ──────────────────────────────────────────────────────────
+            rule_cls = rule_classify(dist, baseline)
+
+            if len(dist_buf) == WINDOW_SIZE and model is not None:
+                feats   = extract_features(
+                    np.array(dist_buf), np.array(str_buf), baseline
+                ).reshape(1, -1)
+                ml_cls  = int(model.predict(feats)[0])
+                ml_conf = float(model.predict_proba(feats)[0][ml_cls])
+                final_cls = ml_cls if ml_conf >= 0.55 else rule_cls
+            else:
+                final_cls = rule_cls
+                ml_conf   = 0.0
+
+            is_ph   = IS_POTHOLE.get(final_cls, False)
+            is_bump = IS_BUMP.get(final_cls, False)
+
+            if is_ph or is_bump:
+                st.session_state.confirm_streak += 1
+            else:
+                st.session_state.confirm_streak = 0
+
+            # ── Confirmed detection ────────────────────────────────────────────────
+            if st.session_state.confirm_streak >= confirm_n:
+                now_t   = time.monotonic()
+                elapsed = now_t - st.session_state.last_detect_t
+
+                if elapsed < cooldown_s:
+                    remaining = cooldown_s - elapsed
+                    # In cooldown: show warning but don't log
+                    status_ph.warning(
+                        f"🟡 **{CLASS_LABELS[final_cls]}** continuing "
+                        f"(cooldown ⏳ {remaining:.1f}s) — "
+                        f"dev: **{dev:+.1f} cm**"
+                    )
+                    st.session_state.confirm_streak = 0
+                else:
+                    # === FIRE ALERT (bypasses UI throttle) ===
+                    dims = compute_dimensions(dist_buf, str_buf, baseline)
+                    if is_ph:   st.session_state.pothole_count += 1
+                    elif is_bump: st.session_state.bump_count  += 1
+
+                    st.session_state.confirm_streak  = 0
+                    st.session_state.last_detect_t   = now_t
+                    st.session_state.last_depth      = dims["depth_cm"]
+
+                    half = len(dist_buf) // 2
+                    dist_buf[:] = dist_buf[half:]
+                    str_buf[:]  = str_buf[half:]
+
+                    log_entry = {
+                        "Time"       : time.strftime("%H:%M:%S"),
+                        "Type"       : CLASS_LABELS[final_cls],
+                        "Dev (cm)"   : f"{dev:+.1f}",
+                        "Depth (cm)" : dims["depth_cm"],
+                        "Length (cm)": dims["length_cm"],
+                        "Width (cm)" : dims["width_cm"],
+                        "Severity"   : dims["severity"],
+                        "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
+                        "Strength"   : int(dims["avg_strength"]),
+                        "Baseline"   : f"{baseline:.0f}",
+                    }
+                    st.session_state.pothole_log.insert(0, log_entry)
+
+                    # Alert fires immediately
+                    status_ph.error(
+                        f"🔴 **{CLASS_LABELS[final_cls]} CONFIRMED** — "
+                        f"dev: **{dev:+.1f} cm** | "
+                        f"depth: **{dims['depth_cm']} cm** | "
+                        f"{dims['severity']}"
+                    )
+                    logger.info("DETECTED: %s", log_entry)
+            else:
+                # Live status (throttled below with UI updates)
+                sb    = ("█" * st.session_state.confirm_streak
+                         + "░" * max(0, confirm_n - st.session_state.confirm_streak))
+                dev_s = f"{dev:+.1f}"
+                if final_cls == 0:
+                    status_ph.success(
+                        f"🟢 Flat Road — dist: **{dist} cm** | "
+                        f"dev: {dev_s} cm | str: {strength} | temp: {temp}°C"
+                    )
+                elif is_ph:
+                    status_ph.warning(
+                        f"🟡 {CLASS_LABELS[final_cls]} — "
+                        f"dist: **{dist} cm** | dev: **{dev_s} cm** | "
+                        f"streak [{sb}] {st.session_state.confirm_streak}/{confirm_n}"
+                    )
+                else:
+                    status_ph.info(
+                        f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm**"
+                    )
+
+            # ── UI UPDATE (throttled to 10 Hz) ────────────────────────────────────
+            now = time.monotonic()
+            if now - last_ui_t >= UI_INTERVAL:
+                ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
+                ph_dist.metric("📡 Distance",    f"{dist} cm")
+                ph_dev.metric("↕️ Deviation",   f"{dev:+.1f} cm",
+                              delta=f"{dev:+.1f}", delta_color="inverse")
+                ph_str.metric("📶 Strength",     strength)
+                ph_temp.metric("🌡️ Temp",        f"{temp}°C")
+                ph_cnt.metric("🕳️ Potholes",    st.session_state.pothole_count)
+                ph_bump.metric("🔶 Bumps",       st.session_state.bump_count)
+                ph_dep.metric("📏 Last Depth",  f"{st.session_state.last_depth} cm")
+
+                chart_dist.line_chart(pd.DataFrame({
+                    "Distance (cm)": list(st.session_state.dist_history),
+                    "Baseline (cm)": list(st.session_state.baseline_hist),
+                }))
+                chart_dev.line_chart(pd.DataFrame({
+                    "Deviation (cm)": list(st.session_state.dev_history),
+                }))
+                chart_str.line_chart(pd.DataFrame({
+                    "Signal Strength": list(st.session_state.str_history),
+                }))
+
+                stats_ph.caption(
+                    f"Thread frames: **{reader.frames}** | "
+                    f"Thread errors: **{reader.errors}** | "
+                    f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
+                    f"Streak: {st.session_state.confirm_streak}/{confirm_n} | "
+                    f"Cooldown: {cooldown_s:.0f}s"
                 )
 
-        # ── UI UPDATE (throttled to 10 Hz) ────────────────────────────────────
-        now = time.monotonic()
-        if now - last_ui_t >= UI_INTERVAL:
-            ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
-            ph_dist.metric("📡 Distance",    f"{dist} cm")
-            ph_dev.metric("↕️ Deviation",   f"{dev:+.1f} cm",
-                          delta=f"{dev:+.1f}", delta_color="inverse")
-            ph_str.metric("📶 Strength",     strength)
-            ph_temp.metric("🌡️ Temp",        f"{temp}°C")
-            ph_cnt.metric("🕳️ Potholes",    st.session_state.pothole_count)
-            ph_bump.metric("🔶 Bumps",       st.session_state.bump_count)
-            ph_dep.metric("📏 Last Depth",  f"{st.session_state.last_depth} cm")
+                if st.session_state.pothole_log:
+                    log_ph.subheader("📋 Detection Log")
+                    log_ph.dataframe(
+                        pd.DataFrame(st.session_state.pothole_log).head(50),
+                        width="stretch",
+                    )
 
-            chart_dist.line_chart(pd.DataFrame({
-                "Distance (cm)": list(st.session_state.dist_history),
-                "Baseline (cm)": list(st.session_state.baseline_hist),
-            }))
-            chart_dev.line_chart(pd.DataFrame({
-                "Deviation (cm)": list(st.session_state.dev_history),
-            }))
-            chart_str.line_chart(pd.DataFrame({
-                "Signal Strength": list(st.session_state.str_history),
-            }))
+                last_ui_t = now
 
-            stats_ph.caption(
-                f"Thread frames: **{reader.frames}** | "
-                f"Thread errors: **{reader.errors}** | "
-                f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
-                f"Streak: {st.session_state.confirm_streak}/{confirm_n} | "
-                f"Cooldown: {cooldown_s:.0f}s"
-            )
+            time.sleep(0.02)   # 50 Hz poll rate — very fast, UI still only at 10 Hz
 
-            if st.session_state.pothole_log:
-                log_ph.subheader("📋 Detection Log")
-                log_ph.dataframe(
-                    pd.DataFrame(st.session_state.pothole_log).head(50),
-                    width="stretch",
-                )
-
-            last_ui_t = now
-
-        time.sleep(0.02)   # 50 Hz poll rate — very fast, UI still only at 10 Hz
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    reader.stop()
-    lidar.close()
-    st.session_state.running = False
-    st.info("⏹ Stopped.")
+    finally:
+        # ── Cleanup (Guaranteed to run even if Streamlit interrupts) ─────────
+        reader.stop()
+        lidar.close()
+        st.session_state.running = False
+        st.info("⏹ Stopped.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
