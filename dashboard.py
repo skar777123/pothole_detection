@@ -21,6 +21,8 @@ import numpy as np
 import time
 import joblib
 import logging
+import sys
+import os
 from collections import deque
 
 from lidar_driver import (
@@ -64,10 +66,27 @@ SEVERITY_BANDS = [
 def load_model():
     try:
         m = joblib.load("pothole_model.pkl")
-        logger.info("Model loaded.")
+        logger.info("RF Model loaded.")
         return m
     except FileNotFoundError:
         return None
+
+@st.cache_resource(show_spinner="Loading DL model …")
+def load_dl_model():
+    try:
+        dl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DL_Model")
+        if dl_dir not in sys.path:
+            sys.path.insert(0, dl_dir)
+        from dl_model import load_model as keras_load_model
+        from dl_config import MODEL_SAVE_PATH, SCALER_SAVE_PATH
+        
+        dl_m = keras_load_model(MODEL_SAVE_PATH)
+        dl_s = joblib.load(SCALER_SAVE_PATH)
+        logger.info("DL Model loaded.")
+        return dl_m, dl_s
+    except Exception as e:
+        logger.error(f"Failed to load DL model: {e}")
+        return None, None
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -91,6 +110,9 @@ _defaults = {
     "dist_buf"          : [],
     "str_buf"           : [],
     "last_detect_t"     : 0.0,
+    "dl_dist_buf"       : [],            # DL Model specific buffer
+    "dl_str_buf"        : [],            # DL Model specific buffer
+    "dl_dev_buf"        : [],            # DL Model specific buffer
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -241,7 +263,7 @@ def show_diagnostic():
 
 # ── Main detection loop ───────────────────────────────────────────────────────
 
-def run_detection(model):
+def run_detection(model, dl_model=None, dl_scaler=None):
     # ── Open LiDAR ───────────────────────────────────────────────────────────
     try:
         lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud, send_init=send_init)
@@ -281,6 +303,10 @@ def run_detection(model):
     # Local variables
     dist_buf  = st.session_state.dist_buf
     str_buf   = st.session_state.str_buf
+    dl_dist_buf = st.session_state.dl_dist_buf
+    dl_str_buf  = st.session_state.dl_str_buf
+    dl_dev_buf  = st.session_state.dl_dev_buf
+
     last_ui_t = 0.0
     UI_INTERVAL = 0.10     # update UI at 10 Hz
     no_data_count = 0
@@ -370,20 +396,50 @@ def run_detection(model):
             if len(dist_buf) > WINDOW_SIZE:
                 dist_buf.pop(0)
                 str_buf.pop(0)
+                
+            # DL Specific window (30 elements config)
+            DL_WINDOW_SIZE = 30
+            dl_dist_buf.append(dist)
+            dl_str_buf.append(strength)
+            dl_dev_buf.append(dev)
+            if len(dl_dist_buf) > DL_WINDOW_SIZE:
+                dl_dist_buf.pop(0)
+                dl_str_buf.pop(0)
+                dl_dev_buf.pop(0)
 
             # ── Classify ──────────────────────────────────────────────────────────
             rule_cls = rule_classify(dist, baseline)
+            
+            ml_conf = 0.0
+            final_cls = rule_cls
+            ml_source = "rule"
 
-            if len(dist_buf) == WINDOW_SIZE and model is not None:
+            if len(dl_dist_buf) == DL_WINDOW_SIZE and dl_model is not None and dl_scaler is not None:
+                # DL Inference
+                window = np.column_stack([dl_dist_buf, dl_str_buf, dl_dev_buf]) # (30, 3)
+                try:
+                    scaled_window = dl_scaler.transform(window)
+                    tensor = scaled_window.reshape(1, DL_WINDOW_SIZE, 3).astype(np.float32)
+                    probs = dl_model.predict(tensor, verbose=0)[0]
+                    dl_cls = int(np.argmax(probs))
+                    dl_conf = float(probs[dl_cls])
+                    if dl_conf >= 0.55:
+                        final_cls = dl_cls
+                        ml_conf = dl_conf
+                        ml_source = "dl"
+                except Exception as e:
+                    logger.error(f"DL Inference Error: {e}")
+            elif len(dist_buf) == WINDOW_SIZE and model is not None:
+                # Random Forest Inference fallback
                 feats   = extract_features(
                     np.array(dist_buf), np.array(str_buf), baseline
                 ).reshape(1, -1)
                 ml_cls  = int(model.predict(feats)[0])
-                ml_conf = float(model.predict_proba(feats)[0][ml_cls])
-                final_cls = ml_cls if ml_conf >= 0.55 else rule_cls
-            else:
-                final_cls = rule_cls
-                ml_conf   = 0.0
+                rf_conf = float(model.predict_proba(feats)[0][ml_cls])
+                if rf_conf >= 0.55:
+                    final_cls = ml_cls
+                    ml_conf = rf_conf
+                    ml_source = "rf"
 
             is_ph   = IS_POTHOLE.get(final_cls, False)
             is_bump = IS_BUMP.get(final_cls, False)
@@ -429,7 +485,8 @@ def run_detection(model):
                         "Length (cm)": dims["length_cm"],
                         "Width (cm)" : dims["width_cm"],
                         "Severity"   : dims["severity"],
-                        "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
+                        "Conf."      : f"{ml_conf:.0%}" if ml_source != "rule" else "rule",
+                        "Source"     : ml_source,
                         "Strength"   : int(dims["avg_strength"]),
                         "Baseline"   : f"{baseline:.0f}",
                     }
@@ -527,9 +584,13 @@ st.title("🕳️ Pothole Detection — TF02-Pro LiDAR")
 st.caption("Background thread · 100 Hz sensor · 10 Hz UI · Instant distance updates")
 
 model = load_model()
-if model is None:
-    st.warning("⚠️ `pothole_model.pkl` not found — rule-only mode. "
-               "Run `python model_train.py` to enable ML.")
+dl_model, dl_scaler = load_dl_model()
+
+if model is None and dl_model is None:
+    st.warning("⚠️ No machine learning models found — rule-only mode. "
+               "Run `python model_train.py` or training script to enable ML.")
+elif dl_model is not None:
+    st.success("✅ Deep Learning model loaded!")
 
 if not st.session_state.running:
     c1, _ = st.columns([2, 5])
@@ -542,4 +603,4 @@ if not st.session_state.running:
     show_diagnostic()
 
 if st.session_state.running:
-    run_detection(model)
+    run_detection(model, dl_model, dl_scaler)
