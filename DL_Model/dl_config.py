@@ -27,7 +27,7 @@ BASELINE_CM      = 1000.0   # Fixed sensor-to-road distance (cm)
 BASELINE_MIN_CM  =   50.0   # Minimum baseline in synthetic data
 BASELINE_MAX_CM  = 1000.0   # Maximum baseline in synthetic data
 POTHOLE_THRESH   =    3.0   # Min +deviation to call a pothole (cm)
-BUMP_THRESH      =    3.0   # Min -deviation to call a speed bump (cm)
+BUMP_THRESH      =    5.0   # Min -deviation to call a speed bump (cm) (raised to avoid noise)
 NOISE_STD        =    1.5   # Sensor noise std at close range (cm)
 
 # ── Adaptive Baseline constants ───────────────────────────────────────────────
@@ -49,7 +49,7 @@ ADAPT_VEL_DOWN_THRESH= -2.0   # cm/reading → end of a pothole
 # Depth-duration guard: how many *consecutive* readings the deviation must
 # stay above POTHOLE_THRESH before we confirm a pothole.
 # At 10 Hz: 3 → 300 ms, 5 → 500 ms  (rejects single-spike noise)
-ADAPT_MIN_DURATION   =  3     # readings
+ADAPT_MIN_DURATION   =  5     # readings  (raised from 3 to reject LiDAR noise bursts)
 
 # Feature vector produced by AdaptiveBaseline  → feed into LSTM model
 # [dist, strength, ma_dev, hp_signal, velocity, above_thresh_flag]

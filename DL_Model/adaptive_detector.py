@@ -423,8 +423,10 @@ class AdaptiveDetector:
         vel, spike_up, spike_down = self._drv.update(dist)
         self._vel_history.append(vel)
 
-        # Stage 4 – Depth-Duration guard
-        confirmed, run_len = self._dur.update(ma_dev)
+        # Stage 4 – Depth-Duration guard  (uses absolute deviation for both
+        # potholes and bumps)
+        abs_dev = abs(ma_dev)
+        confirmed, run_len = self._dur.update(abs_dev)
 
         # Push into feature buffer
         above_flag = 1.0 if ma_dev > POTHOLE_THRESH else 0.0
@@ -450,6 +452,19 @@ class AdaptiveDetector:
                 class_id, confidence, spike_up, spike_down,
                 confirmed, run_len
             )
+
+        # ── Sanity guard ─────────────────────────────────────────────────────
+        # Override model/rule classification if the actual deviation is too
+        # small — prevents LiDAR noise from being classified as anomalies.
+        cls = result["class_id"]
+        if cls in (1, 2) and ma_dev < POTHOLE_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / POTHOLE_THRESH), 4)
+        elif cls == 3 and ma_dev > -BUMP_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / BUMP_THRESH), 4)
 
         self.latest_result = result
         self.alert = (
