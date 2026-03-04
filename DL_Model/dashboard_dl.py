@@ -556,7 +556,7 @@ with tab_live:
                 "to establish the baseline distance. Detection will start automatically.")
 
     # Alert banner
-    if latest and latest["alert"]:
+    if cal_done and latest and latest["alert"]:
         st.markdown(
             f'<div class="alert-box">⚠️  POTHOLE DETECTED! '
             f'Depth: {latest["depth_cm"]:.1f} cm  |  '
@@ -565,7 +565,7 @@ with tab_live:
             unsafe_allow_html=True
         )
 
-    # Distance + deviation plot
+    # Distance + deviation plot (always show — even during calibration)
     st.plotly_chart(
         _distance_plot(
             st.session_state["readings"],
@@ -575,69 +575,69 @@ with tab_live:
         use_container_width=True, key="dist_plot"
     )
 
-    # Confidence breakdown
-    if latest and latest.get("probs"):
-        st.markdown("#### Class Probability Breakdown")
-        st.plotly_chart(_confidence_fig(latest),
-                        use_container_width=True, key="conf_plot")
+    if cal_done:
+        # Confidence breakdown
+        if latest and latest.get("probs"):
+            st.markdown("#### Class Probability Breakdown")
+            st.plotly_chart(_confidence_fig(latest),
+                            use_container_width=True, key="conf_plot")
 
-    # Extra adaptive info row
-    if latest:
-        i1, i2, i3, i4 = st.columns(4)
-        vel  = latest.get("velocity_cm", 0)
-        run  = latest.get("duration_run", 0)
-        vp   = latest.get("vel_pattern", False)
-        conf_dur = latest.get("duration_confirmed", False)
-        i1.metric("Velocity (cm/reading)", f"{vel:+.2f}")
-        i2.metric("Duration Run",
-                  f"{run} / {min_dur} rdgs",
-                  delta="Confirmed!" if conf_dur else None,
-                  delta_color="normal" if conf_dur else "off")
-        i3.metric("Vel Pattern", "↗↘ Yes" if vp else "—")
-        i4.metric("MA Deviation",
-                  f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
+        # Extra adaptive info row
+        if latest:
+            i1, i2, i3, i4 = st.columns(4)
+            vel  = latest.get("velocity_cm", 0)
+            run  = latest.get("duration_run", 0)
+            vp   = latest.get("vel_pattern", False)
+            conf_dur = latest.get("duration_confirmed", False)
+            i1.metric("Velocity (cm/reading)", f"{vel:+.2f}")
+            i2.metric("Duration Run",
+                      f"{run} / {min_dur} rdgs",
+                      delta="Confirmed!" if conf_dur else None,
+                      delta_color="normal" if conf_dur else "off")
+            i3.metric("Vel Pattern", "↗↘ Yes" if vp else "—")
+            i4.metric("MA Deviation",
+                      f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
 
-    # ── Latest event info ────────────────────────────────────────────────
-    if events:
-        st.markdown("#### 🕳️ Latest Detected Event")
-        ev = events[-1]
-        ev_type_col = CLASS_COLORS.get(ev["type_id"], "#8b949e")
-        e1, e2, e3, e4, e5 = st.columns(5)
-        with e1:
-            st.markdown(f"""<div class="metric-card">
-              <h3>Type</h3>
-              <p class="val" style="color:{ev_type_col};">{ev['type']}</p>
-              <p class="sub">{ev['severity']}</p>
-            </div>""", unsafe_allow_html=True)
-        with e2:
-            st.markdown(f"""<div class="metric-card">
-              <h3>Max Depth</h3>
-              <p class="val">{ev['max_depth_cm']} cm</p>
-              <p class="sub">Avg: {ev['avg_depth_cm']} cm</p>
-            </div>""", unsafe_allow_html=True)
-        with e3:
-            st.markdown(f"""<div class="metric-card">
-              <h3>Width / Length</h3>
-              <p class="val">{ev['width_cm']} cm</p>
-              <p class="sub">{ev['width_m']} m</p>
-            </div>""", unsafe_allow_html=True)
-        with e4:
-            st.markdown(f"""<div class="metric-card">
-              <h3>Duration</h3>
-              <p class="val">{ev['n_readings']} rdgs</p>
-              <p class="sub">{ev['n_readings'] / max(sample_rate, 1):.2f} sec</p>
-            </div>""", unsafe_allow_html=True)
-        with e5:
-            st.markdown(f"""<div class="metric-card">
-              <h3>Total Events</h3>
-              <p class="val" style="color:#f85149;">{len(events)}</p>
-              <p class="sub">Potholes + Bumps</p>
-            </div>""", unsafe_allow_html=True)
+        # ── Latest event info ────────────────────────────────────────────
+        if events:
+            st.markdown("#### 🕳️ Latest Detected Event")
+            ev = events[-1]
+            ev_type_col = CLASS_COLORS.get(ev["type_id"], "#8b949e")
+            e1, e2, e3, e4, e5 = st.columns(5)
+            with e1:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Type</h3>
+                  <p class="val" style="color:{ev_type_col};">{ev['type']}</p>
+                  <p class="sub">{ev['severity']}</p>
+                </div>""", unsafe_allow_html=True)
+            with e2:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Max Depth</h3>
+                  <p class="val">{ev['max_depth_cm']} cm</p>
+                  <p class="sub">Avg: {ev['avg_depth_cm']} cm</p>
+                </div>""", unsafe_allow_html=True)
+            with e3:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Width / Length</h3>
+                  <p class="val">{ev['width_cm']} cm</p>
+                  <p class="sub">{ev['width_m']} m</p>
+                </div>""", unsafe_allow_html=True)
+            with e4:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Duration</h3>
+                  <p class="val">{ev['n_readings']} rdgs</p>
+                  <p class="sub">{ev['n_readings'] / max(sample_rate, 1):.2f} sec</p>
+                </div>""", unsafe_allow_html=True)
+            with e5:
+                st.markdown(f"""<div class="metric-card">
+                  <h3>Total Events</h3>
+                  <p class="val" style="color:#f85149;">{len(events)}</p>
+                  <p class="sub">Potholes + Bumps</p>
+                </div>""", unsafe_allow_html=True)
 
     # ── Auto-rerun for continuous streaming ───────────────────────────
-    if st.session_state["running"]:
-        time.sleep(stream_speed / 1000.0)
-        st.rerun()
+    time.sleep(stream_speed / 1000.0)
+    st.rerun()
 
 
 # ╔═══════════════════════════════════════════════════════╗
@@ -647,7 +647,7 @@ with tab_events:
     ev_list = st.session_state["events"]
     if not ev_list:
         st.info("No pothole or speed-bump events detected yet. "
-                "Click ▶ Start on the Live Detection tab.")
+                "Events will appear automatically once the system detects anomalies.")
     else:
         # Summary KPIs
         n_potholes = sum(1 for e in ev_list if e["type_id"] in (1, 2))
