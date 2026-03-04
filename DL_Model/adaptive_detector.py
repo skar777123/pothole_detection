@@ -248,7 +248,9 @@ class _DepthDurationGuard:
         confirmed  : deviation has been sustained for ≥ min_duration readings
         run_length : current consecutive-readings count above threshold
         """
-        if deviation > self._thresh:
+        # CRITICAL FIX: To detect hands/bumps, we must check absolute deviation
+        # since bumps are negative deviations
+        if abs(deviation) > self._thresh:
             self._run += 1
         else:
             self._run  = 0
@@ -331,11 +333,14 @@ def _rule_based_classify(
             return 1, round(confidence, 4)
 
     # Not confirmed but still has meaningful deviation → suspicious
-    if ma_dev > POTHOLE_THRESH and run_length > 0:
+    if run_length > 0:
         conf = run_length / ADAPT_MIN_DURATION * 0.5
-        return 1, round(min(conf, 0.55), 4)
+        if ma_dev > POTHOLE_THRESH:
+            return 1, round(min(conf, 0.55), 4)      # Suspicious Pothole
+        elif ma_dev < -BUMP_THRESH:
+            return 3, round(min(conf, 0.55), 4)      # Suspicious Bump
 
-    return 0, round(max(0.0, 1.0 - abs(ma_dev) / POTHOLE_THRESH), 4)
+    return 0, round(max(0.0, 1.0 - abs(ma_dev) / max(POTHOLE_THRESH, BUMP_THRESH)), 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
