@@ -370,9 +370,9 @@ with st.sidebar:
                              RT_CONFIDENCE_THRESHOLD,  step=0.05)
     alert_depth  = st.slider("Alert depth (cm)",      1.0, 40.0,
                              RT_ALERT_DEPTH_CM,        step=0.5)
-    steps_per_click = st.slider("Readings per batch",  1, 50, 10)
+    steps_per_click = st.slider("Readings per batch",  1, 50, 2)
     stream_speed    = st.slider("Stream speed (ms between batches)",
-                                50, 2000, 200, step=50,
+                                10, 2000, 50, step=10,
                                 help="Lower → faster updates when streaming")
 
     st.divider()
@@ -410,36 +410,48 @@ tab_live, tab_events, tab_log, tab_stats = st.tabs(
 
 # ── Serial reader helper ────────────────────────────────────────────────────
 def _read_serial_batch(port: str, baud: int, n: int) -> list[tuple[float, float]]:
-    """Read up to `n` distance/strength pairs from a TFMini-style serial LiDAR."""
+    """
+    Read up to `n` distance/strength pairs from a TFMini-style serial LiDAR.
+    CRITICAL PI FIX: Drains the entire OS serial buffer first to ensure zero latency.
+    """
     try:
         import serial
     except ImportError:
         st.error("PySerial is required for serial mode: `pip install pyserial`")
         return []
+        
     try:
-        ser = serial.Serial(port, baud, timeout=1)
+        ser = serial.Serial(port, baud, timeout=0.1)
     except Exception as e:
         st.error(f"Cannot open serial port **{port}**: {e}")
         return []
+        
     pairs: list[tuple[float, float]] = []
-    buf = b""
-    deadline = time.time() + 2.0          # max 2 s per batch
+    
     try:
-        while len(pairs) < n and time.time() < deadline:
-            chunk = ser.read(max(1, ser.in_waiting))
-            if not chunk:
-                continue
-            buf += chunk
-            while len(buf) >= 9:
-                if buf[0] == 0x59 and buf[1] == 0x59:
-                    dist = float(buf[3] << 8 | buf[2])
-                    strn = float(buf[5] << 8 | buf[4])
+        # 1. Drain the massive backlog of stale data that built up while Streamlit slept
+        waiting = ser.in_waiting
+        if waiting > 100:
+            ser.read(waiting - 36)  # Flush most of it, leave enough for a few fresh frames
+            
+        # 2. Read fresh frames
+        buf = ser.read(100)
+        
+        # 3. Parse backwards or collect the first N complete frames we find
+        while len(pairs) < n and len(buf) >= 9:
+            if buf[0] == 0x59 and buf[1] == 0x59:
+                dist = float(buf[3] << 8 | buf[2])
+                strn = float(buf[5] << 8 | buf[4])
+                
+                # Sanity check distance max ranges before appending
+                if 1 <= dist <= 2200:
                     pairs.append((dist, strn))
-                    buf = buf[9:]
-                else:
-                    buf = buf[1:]
+                buf = buf[9:]
+            else:
+                buf = buf[1:]
     finally:
         ser.close()
+        
     return pairs
 
 
