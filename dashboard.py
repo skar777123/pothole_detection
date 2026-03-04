@@ -201,10 +201,9 @@ def show_diagnostic():
         if st.button("🔍 Raw Byte Test", type="primary"):
             try:
                 with st.spinner("Opening port and reading raw bytes …"):
-                    lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
-                                    timeout=0.5, send_init=send_init)
-                    raw = lidar.diagnostic_raw_dump(90)
-                    lidar.close()
+                    with TF02Pro(port=lidar_port, baudrate=lidar_baud,
+                                 timeout=0.5, send_init=send_init) as lidar:
+                        raw = lidar.diagnostic_raw_dump(90)
 
                 if not raw:
                     st.error(
@@ -234,10 +233,9 @@ def show_diagnostic():
         if st.button("📡 Single Frame Test"):
             try:
                 with st.spinner("Reading one frame …"):
-                    lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud,
-                                    timeout=0.5, send_init=send_init)
-                    r = lidar.read_frame()
-                    lidar.close()
+                    with TF02Pro(port=lidar_port, baudrate=lidar_baud,
+                                 timeout=0.5, send_init=send_init) as lidar:
+                        r = lidar.read_frame()
                 st.success("✅ Frame OK!")
                 st.json(r)
             except Exception as exc:
