@@ -49,7 +49,7 @@ ADAPT_VEL_DOWN_THRESH= -2.0   # cm/reading → end of a pothole
 # Depth-duration guard: how many *consecutive* readings the deviation must
 # stay above POTHOLE_THRESH before we confirm a pothole.
 # At 10 Hz: 3 → 300 ms, 5 → 500 ms  (rejects single-spike noise)
-ADAPT_MIN_DURATION   =  5     # readings  (raised from 3 to reject LiDAR noise bursts)
+ADAPT_MIN_DURATION   =  2     # readings  (lowered from 5 to detect hands/fast obstacles instantly)
 
 # Feature vector produced by AdaptiveBaseline  → feed into LSTM model
 # [dist, strength, ma_dev, hp_signal, velocity, above_thresh_flag]

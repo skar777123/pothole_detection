@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time LiDAR Pothole Detector</title>
+    <!-- Modern font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Chart.js for real-time graphing -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --border: #30363d;
+            --text-main: #c9d1d9;
+            --text-muted: #8b949e;
+            --color-flat: #2ea043;
+            --color-shallow: #f0e030;
+            --color-deep: #f85149;
+            --color-bump: #58a6ff;
+            --color-baseline: #8b949e;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        h1 {
+            background: linear-gradient(90deg, var(--color-bump), var(--color-deep));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 2.2rem;
+            margin: 0 0 5px 0;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            margin-bottom: 30px;
+        }
+
+        .dashboard {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            max-width: 1200px;
+            gap: 20px;
+        }
+
+        .top-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+        }
+
+        .card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .card h3 {
+            margin: 0 0 10px 0;
+            font-size: 1rem;
+            color: var(--text-muted);
+        }
+
+        .card .val {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin: 0 0 5px 0;
+        }
+
+        .card .sub {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin: 0;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .chart-container {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            height: 450px;
+            position: relative;
+        }
+
+        .alert-banner {
+            display: none;
+            background-color: rgba(248, 81, 73, 0.15);
+            border: 1px solid var(--color-deep);
+            color: #ff7b72;
+            padding: 15px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 1.2rem;
+            text-align: center;
+            margin-bottom: 20px;
+            box-shadow: 0 0 15px rgba(248, 81, 73, 0.4);
+            animation: pulse 1s infinite alternate;
+        }
+
+        @keyframes pulse {
+            from { box-shadow: 0 0 10px rgba(248, 81, 73, 0.4); }
+            to { box-shadow: 0 0 25px rgba(248, 81, 73, 0.8); }
+        }
+
+        .log-container {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0;
+            max-height: 250px;
+            overflow-y: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: center;
+        }
+
+        th {
+            background-color: #21262d;
+            position: sticky;
+            top: 0;
+            padding: 10px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 10px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+
+        tr:nth-child(even) {
+            background-color: rgba(255,255,255,0.02);
+        }
+
+        /* Class Colors */
+        .color-0 { color: var(--color-flat); }
+        .color-1 { color: var(--color-shallow); }
+        .color-2 { color: var(--color-deep); }
+        .color-3 { color: var(--color-bump); }
+
+        .connection-status {
+            position: fixed;
+            top: 10px;
+            right: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            background: var(--bg-card);
+            padding: 5px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+        }
+
+        .dot {
+            height: 10px;
+            width: 10px;
+            background-color: var(--color-deep);
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .dot.connected { background-color: var(--color-flat); box-shadow: 0 0 8px var(--color-flat); }
+    </style>
+</head>
+<body>
+
+    <div class="connection-status">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">Disconnected</span>
+    </div>
+
+    <h1>🚦 Real-Time Pothole Detector</h1>
+    <p class="subtitle">Live WebSocket Feed (Every single reading)</p>
+
+    <div class="dashboard">
+
+        <div class="alert-banner" id="alert-banner">
+            ⚠️ POTHOLE/OBSTACLE DETECTED!
+        </div>
+
+        <div class="top-row">
+            <div class="card">
+                <h3>Current Class</h3>
+                <p class="val" id="val-class">---</p>
+                <p class="sub" id="sub-class">Waiting for data</p>
+            </div>
+            <div class="card">
+                <h3>Depth / Height</h3>
+                <p class="val" id="val-depth">0.0 cm</p>
+                <p class="sub" id="sub-severity">---</p>
+            </div>
+            <div class="card">
+                <h3>Confidence</h3>
+                <p class="val" id="val-conf">0%</p>
+                <p class="sub">LSTM Model</p>
+            </div>
+            <div class="card">
+                <h3>Baseline Distance</h3>
+                <p class="val" id="val-base">0.0 cm</p>
+                <p class="sub" id="sub-readings">Total: 0</p>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="liveChart"></canvas>
+        </div>
+
+        <div class="log-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Class</th>
+                        <th>Conf</th>
+                        <th>Depth (cm)</th>
+                        <th>Dev (cm)</th>
+                        <th>Severity</th>
+                        <th>Alert</th>
+                    </tr>
+                </thead>
+                <tbody id="log-body">
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <script>
+        const CLASS_COLORS = {
+            0: "#2ea043", // Flat
+            1: "#f0e030", // Shallow
+            2: "#f85149", // Deep
+            3: "#58a6ff"  // Bump
+        };
+
+        const MAX_POINTS = 150;
+        let totalReadings = 0;
+
+        // Setup Chart
+        const ctx = document.getElementById('liveChart').getContext('2d');
+        const liveChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: Array(MAX_POINTS).fill(''),
+                datasets: [
+                    {
+                        label: 'Distance (cm)',
+                        borderColor: '#58a6ff',
+                        backgroundColor: 'rgba(88, 166, 255, 0.1)',
+                        borderWidth: 2,
+                        pointRadius: 3,
+                        pointBackgroundColor: Array(MAX_POINTS).fill('#8b949e'),
+                        pointBorderColor: 'transparent',
+                        data: Array(MAX_POINTS).fill(null),
+                        fill: true,
+                        tension: 0.1
+                    },
+                    {
+                        label: 'Adaptive Baseline',
+                        borderColor: '#8b949e',
+                        borderWidth: 2,
+                        borderDash: [5, 5],
+                        pointRadius: 0,
+                        data: Array(MAX_POINTS).fill(null),
+                        fill: false,
+                        tension: 0.1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false, // Turn off for real-time performance
+                plugins: {
+                    legend: { labels: { color: '#c9d1d9' } }
+                },
+                scales: {
+                    x: {
+                        grid: { color: '#30363d' },
+                        ticks: { display: false }
+                    },
+                    y: {
+                        grid: { color: '#30363d' },
+                        ticks: { color: '#8b949e' },
+                        title: { display: true, text: 'Distance (cm)', color: '#8b949e' }
+                    }
+                }
+            }
+        });
+
+        // WebSocket Connection
+        let ws;
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                document.getElementById('conn-dot').classList.add('connected');
+                document.getElementById('conn-text').textContent = 'Live Stream';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('conn-dot').classList.remove('connected');
+                document.getElementById('conn-text').textContent = 'Disconnected (Reconnecting...)';
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = (err) => console.error("WS Error", err);
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+        }
+
+        function updateDashboard(data) {
+            totalReadings++;
+            
+            // Reconstruct absolute distance from baseline + deviation
+            const absoluteDist = data.baseline_cm + data.ma_deviation_cm;
+            const classColor = CLASS_COLORS[data.class_id] || '#8b949e';
+
+            // 1. Update Chart
+            const distData = liveChart.data.datasets[0].data;
+            const baseData = liveChart.data.datasets[1].data;
+            const ptColors = liveChart.data.datasets[0].pointBackgroundColor;
+
+            distData.push(absoluteDist);
+            baseData.push(data.baseline_cm);
+            ptColors.push(classColor);
+
+            if (distData.length > MAX_POINTS) {
+                distData.shift();
+                baseData.shift();
+                ptColors.shift();
+            }
+
+            // Adjust Y-axis dynamically based on baseline to keep the view centered
+            liveChart.options.scales.y.min = Math.max(0, data.baseline_cm - 100);
+            liveChart.options.scales.y.max = data.baseline_cm + 100;
+
+            liveChart.update();
+
+            // 2. Update KPI Cards
+            const valClass = document.getElementById('val-class');
+            valClass.textContent = data.class_name;
+            valClass.style.color = classColor;
+            
+            const subClass = document.getElementById('sub-class');
+            subClass.textContent = data.alert ? '⚠️ ACTION REQUIRED' : 'Normal';
+            subClass.style.color = data.alert ? '#f85149' : '#8b949e';
+
+            document.getElementById('val-depth').textContent = data.depth_cm.toFixed(1) + ' cm';
+            document.getElementById('sub-severity').textContent = data.severity;
+            document.getElementById('val-conf').textContent = (data.confidence * 100).toFixed(1) + '%';
+            document.getElementById('val-base').textContent = data.baseline_cm.toFixed(1) + ' cm';
+            document.getElementById('sub-readings').textContent = 'Total: ' + totalReadings;
+
+            // 3. Alert Banner
+            const banner = document.getElementById('alert-banner');
+            if (data.alert) {
+                banner.style.display = 'block';
+                banner.innerText = `⚠️ ${data.class_name.toUpperCase()} DETECTED! Depth: ${data.depth_cm.toFixed(1)} cm`;
+            } else {
+                banner.style.display = 'none';
+            }
+
+            // 4. Update Log (only for anomalous classes or alerts to prevent spam)
+            if (data.class_id > 0 || data.alert) {
+                const tbody = document.getElementById('log-body');
+                const row = document.createElement('tr');
+                const timeStr = new Date().toLocaleTimeString('en-US', {hour12:false, hour:"numeric", minute:"numeric", second:"numeric", fractionalSecondDigits: 2});
+                
+                row.innerHTML = `
+                    <td>${timeStr}</td>
+                    <td style="color:${classColor}; font-weight:bold;">${data.class_name}</td>
+                    <td>${(data.confidence * 100).toFixed(1)}%</td>
+                    <td>${data.depth_cm.toFixed(1)}</td>
+                    <td>${data.ma_deviation_cm > 0 ? '+' : ''}${data.ma_deviation_cm.toFixed(1)}</td>
+                    <td>${data.severity}</td>
+                    <td>${data.alert ? '⚠️' : ''}</td>
+                `;
+                
+                tbody.insertBefore(row, tbody.firstChild);
+                
+                // Keep log short
+                if (tbody.children.length > 50) {
+                    tbody.removeChild(tbody.lastChild);
+                }
+            }
+        }
+
+        // Initialize
+        connect();
+    </script>
+</body>
+</html>

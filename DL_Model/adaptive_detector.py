@@ -451,7 +451,8 @@ class AdaptiveDetector:
         confirmed, run_len = self._dur.update(abs_dev)
 
         # Push into feature buffer
-        above_flag = 1.0 if ma_dev > POTHOLE_THRESH else 0.0
+        # Flag is 1.0 if deviation exceeds pothole OR bump threshold
+        above_flag = 1.0 if (ma_dev > POTHOLE_THRESH or ma_dev < -BUMP_THRESH) else 0.0
         self._fbuf.push(dist, strength, ma_dev, hp, vel, above_flag)
 
         # We need the baseline window filled before we trust ma_dev
@@ -487,10 +488,17 @@ class AdaptiveDetector:
             result["class_id"]   = 0
             result["class_name"] = CLASS_NAMES[0]
             result["confidence"] = round(max(0.0, 1.0 - abs_dev / BUMP_THRESH), 4)
-
+            
+        # Recompute depth and severity specifically for alerts
+        if result["class_id"] == 3:  # Bump
+            # Depth is the extent to which it protrudes up from the baseline
+            # (ma_dev is negative, so depth is abs(ma_dev))
+            result["depth_cm"] = round(abs(ma_dev), 1)
+            result["severity"] = _severity_label(result["depth_cm"])
+        
         self.latest_result = result
         self.alert = (
-            result["class_id"] in (1, 2) and
+            result["class_id"] in (1, 2, 3) and  # Including bumps / obstacles in alerts
             result["depth_cm"] >= self._alert_depth
         )
         result["alert"] = self.alert
@@ -548,7 +556,7 @@ class AdaptiveDetector:
                       confirmed, run_len,
                       probs=None) -> dict:
         """Assemble the standardised result dict."""
-        depth_cm = round(max(0.0, ma_dev), 1)
+        depth_cm = round(abs(ma_dev) if (class_id == 3 or ma_dev < 0) else max(0.0, ma_dev), 1)
         severity = _severity_label(depth_cm)
 
         # Velocity pattern: look for historical spike-up then spike-down
