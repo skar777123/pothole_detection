@@ -363,9 +363,11 @@ with st.sidebar:
     min_dur      = st.slider("Min duration (readings)", 1, 10,
                              ADAPT_MIN_DURATION, step=1)
 
-    st.markdown("**Model**")
-    model_ok     = os.path.exists(MODEL_SAVE_PATH)
-    use_model    = st.checkbox("Use LSTM model", value=model_ok)
+    st.markdown("**Model (Disabled by Request)**")
+    # model_ok     = os.path.exists(MODEL_SAVE_PATH)
+    # use_model    = st.checkbox("Use LSTM model", value=model_ok)
+    model_ok = False
+    use_model = False
     conf_thresh  = st.slider("Min confidence",        0.3, 0.95,
                              RT_CONFIDENCE_THRESHOLD,  step=0.05)
     alert_depth  = st.slider("Alert depth (cm)",      1.0, 40.0,

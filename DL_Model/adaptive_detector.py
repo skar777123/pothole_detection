@@ -373,14 +373,14 @@ class AdaptiveDetector:
     """
 
     def __init__(self,
-                 use_model:            bool  = False,
-                 ma_window:            int   = ADAPT_MA_WINDOW,
-                 hp_alpha:             float = ADAPT_HP_ALPHA,
-                 min_duration:         int   = ADAPT_MIN_DURATION,
+                 use_model: bool = True,
+                 ma_window: int = ADAPT_MA_WINDOW,
+                 min_duration: int = ADAPT_MIN_DURATION,
                  confidence_threshold: float = RT_CONFIDENCE_THRESHOLD,
-                 alert_depth_cm:       float = RT_ALERT_DEPTH_CM):
+                 alert_depth_cm: float = RT_ALERT_DEPTH_CM):
 
-        self._use_model     = use_model
+        # FORCED RULE-BASED ONLY: User requested to comment out DL lines
+        self._use_model   = False # use_model (Disabled)
         self._conf_thresh   = confidence_threshold
         self._alert_depth   = alert_depth_cm
 
@@ -398,7 +398,8 @@ class AdaptiveDetector:
         self.alert: bool                = False
         self._lock = threading.Lock()
 
-        if use_model:
+        # FORCED RULE-BASED ONLY: Do not load model
+        if False: # use_model:
             _load_model()
 
     # ── public API ─────────────────────────────────────────────────────────────
@@ -460,7 +461,8 @@ class AdaptiveDetector:
             return None
 
         # ── Classify ─────────────────────────────────────────────────────────
-        if self._use_model and self._fbuf.ready:
+        # FORCED RULE-BASED ONLY: Ignoring LSTM model logic
+        if False: # self._use_model and self._fbuf.ready:
             result = self._model_infer(
                 dist, strength, ma_dev, hp, vel,
                 baseline, confirmed, run_len, spike_up, spike_down
