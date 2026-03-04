@@ -558,8 +558,8 @@ with tab_live:
     # Alert banner
     if cal_done and latest and latest["alert"]:
         st.markdown(
-            f'<div class="alert-box">⚠️  POTHOLE DETECTED! '
-            f'Depth: {latest["depth_cm"]:.1f} cm  |  '
+            f'<div class="alert-box">⚠️  {latest["class_name"].upper()} DETECTED! '
+            f'Depth/Height: {latest["depth_cm"]:.1f} cm  |  '
             f'{latest["severity"]}  |  '
             f'Conf: {latest["confidence"]*100:.1f}%</div>',
             unsafe_allow_html=True
