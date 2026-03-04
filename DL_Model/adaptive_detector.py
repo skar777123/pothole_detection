@@ -466,6 +466,9 @@ class AdaptiveDetector:
         """Run the LSTM on the current 6-feature window."""
         window = self._fbuf.as_array()          # (WINDOW_SIZE, 6)
 
+        # Determine how many features the model actually expects
+        model_n_features = _model.input_shape[-1]   # e.g. 3 or 6
+
         # Normalise using saved scaler.
         # Scaler was fitted on 3-feature data; we handle mismatch gracefully:
         # if scaler has 3 features we scale only the first 3 columns.
@@ -473,16 +476,20 @@ class AdaptiveDetector:
             if _scaler.n_features_in_ == ADAPT_N_FEATURES:
                 flat   = window.reshape(-1, ADAPT_N_FEATURES)
                 flat   = _scaler.transform(flat).astype(np.float32)
-                tensor = flat.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
+                window = flat.reshape(WINDOW_SIZE, ADAPT_N_FEATURES)
             else:
                 # Scaler was trained on 3-feature data – scale 3-feature slice
                 flat3   = window[:, :3].reshape(-1, 3)
                 flat3   = _scaler.transform(flat3).astype(np.float32)
                 window[:, :3] = flat3.reshape(WINDOW_SIZE, 3)
-                tensor  = window.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
         except Exception:
-            tensor = window.reshape(1, WINDOW_SIZE, ADAPT_N_FEATURES)
+            pass
 
+        # Slice to match the model's expected feature count
+        if model_n_features < window.shape[1]:
+            window = window[:, :model_n_features]
+
+        tensor = window.reshape(1, WINDOW_SIZE, model_n_features)
         probs      = _model.predict(tensor, verbose=0)[0]   # (4,)
         class_id   = int(np.argmax(probs))
         confidence = float(probs[class_id])
