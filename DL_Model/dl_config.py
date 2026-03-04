@@ -27,7 +27,7 @@ BASELINE_CM      = 1000.0   # Fixed sensor-to-road distance (cm)
 BASELINE_MIN_CM  =   50.0   # Minimum baseline in synthetic data
 BASELINE_MAX_CM  = 1000.0   # Maximum baseline in synthetic data
 POTHOLE_THRESH   =    3.0   # Min +deviation to call a pothole (cm)
-BUMP_THRESH      =    5.0   # Min -deviation to call a speed bump (cm) (raised to avoid noise)
+BUMP_THRESH      =    3.0   # Min -deviation to call a speed bump (cm)
 NOISE_STD        =    1.5   # Sensor noise std at close range (cm)
 
 # ── Adaptive Baseline constants ───────────────────────────────────────────────

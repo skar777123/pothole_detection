@@ -112,14 +112,36 @@ class _MovingAverageBaseline:
     Key insight: as the vehicle goes uphill / downhill the baseline drifts
     slowly, but a pothole causes a sudden spike. The MA baseline adapts to the
     slope while staying insensitive to the short spike.
+
+    IMPORTANT: Once calibrated, readings that deviate more than
+    `freeze_thresh` cm from the current baseline are NOT added to the
+    buffer.  This prevents the baseline from 'chasing' a pothole or bump
+    and keeps it locked to the normal road surface.
     """
 
-    def __init__(self, window: int = ADAPT_MA_WINDOW):
+    def __init__(self, window: int = ADAPT_MA_WINDOW,
+                 freeze_thresh: float = None):
         self._buf = deque(maxlen=window)
         self._sum = 0.0
+        # Default freeze threshold: max of POTHOLE_THRESH and BUMP_THRESH
+        self._freeze_thresh = freeze_thresh or max(POTHOLE_THRESH, BUMP_THRESH)
 
     def update(self, dist_cm: float) -> float:
-        """Push one reading; return current adaptive baseline."""
+        """Push one reading; return current adaptive baseline.
+
+        If the baseline is already calibrated (window full) and the new
+        reading deviates by more than ``freeze_thresh`` from the current
+        mean, it is *excluded* from the buffer so the baseline stays
+        locked to the normal surface distance.
+        """
+        if self.ready:
+            current_baseline = self._sum / len(self._buf)
+            deviation = abs(dist_cm - current_baseline)
+            if deviation > self._freeze_thresh:
+                # Anomalous reading → freeze baseline, return current mean
+                return current_baseline
+
+        # Normal reading → update buffer
         if len(self._buf) == self._buf.maxlen:
             self._sum -= self._buf[0]        # remove oldest
         self._buf.append(dist_cm)
