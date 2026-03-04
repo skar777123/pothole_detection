@@ -31,7 +31,7 @@ from dl_config import (
     RT_CONFIDENCE_THRESHOLD, RT_ALERT_DEPTH_CM,
     MODEL_SAVE_PATH, HISTORY_SAVE_PATH, LOGS_DIR,
     ADAPT_MA_WINDOW, ADAPT_HP_ALPHA, ADAPT_MIN_DURATION,
-    POTHOLE_THRESH, BUMP_THRESH,
+    POTHOLE_THRESH, BUMP_THRESH, SEVERITY_LEVELS,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -98,6 +98,7 @@ def _init_state():
         "baselines"  : [],      # adaptive baseline values
         "results"    : [],      # inference result dicts
         "alerts"     : [],      # alert events
+        "events"     : [],      # detected pothole/bump events with dimensions
         "running"    : False,
         "total"      : 0,
         "detector"   : None,
@@ -107,6 +108,77 @@ def _init_state():
             st.session_state[k] = v
 
 _init_state()
+
+
+# ── Event extraction ───────────────────────────────────────────────────────────
+def _extract_events(results: list[dict],
+                    vehicle_speed_kmh: float,
+                    sample_rate_hz: float) -> list[dict]:
+    """
+    Scan results and group consecutive anomalous readings into discrete
+    pothole / speed-bump events with dimension estimates.
+
+    Width formula:  width_cm = n_readings × (speed_cm_per_sec / sample_rate_hz)
+    """
+    if not results:
+        return []
+
+    speed_cm_s = vehicle_speed_kmh * 100_000 / 3600   # km/h → cm/s
+    cm_per_reading = speed_cm_s / max(sample_rate_hz, 0.1)
+
+    events: list[dict] = []
+    i = 0
+    while i < len(results):
+        r = results[i]
+        cls = r["class_id"]
+        # Only track anomalies (1=shallow, 2=deep, 3=bump)
+        if cls in (1, 2, 3):
+            # Start of an event — gather consecutive anomalous readings
+            event_readings = [r]
+            j = i + 1
+            while j < len(results) and results[j]["class_id"] in (1, 2, 3):
+                event_readings.append(results[j])
+                j += 1
+
+            n = len(event_readings)
+            depths = [er["depth_cm"] for er in event_readings]
+            max_depth = max(depths)
+            avg_depth = sum(depths) / n
+            width_cm  = round(n * cm_per_reading, 1)
+
+            # Determine dominant type
+            type_counts = {1: 0, 2: 0, 3: 0}
+            for er in event_readings:
+                type_counts[er["class_id"]] += 1
+            dominant = max(type_counts, key=type_counts.get)
+
+            # Severity from max depth
+            severity = "Noise"
+            for label, (lo, hi) in SEVERITY_LEVELS.items():
+                if lo <= max_depth < hi:
+                    severity = label
+                    break
+
+            events.append({
+                "event_id"     : len(events) + 1,
+                "type"         : CLASS_NAMES[dominant],
+                "type_id"      : dominant,
+                "n_readings"   : n,
+                "max_depth_cm" : round(max_depth, 1),
+                "avg_depth_cm" : round(avg_depth, 1),
+                "width_cm"     : width_cm,
+                "width_m"      : round(width_cm / 100, 2),
+                "severity"     : severity,
+                "confidence"   : round(
+                    sum(er["confidence"] for er in event_readings) / n, 4),
+                "start_reading": i,
+                "end_reading"  : j - 1,
+                "timestamp"    : event_readings[0].get("timestamp", 0),
+            })
+            i = j
+        else:
+            i += 1
+    return events
 
 
 # ── Detector loader ────────────────────────────────────────────────────────────
@@ -278,6 +350,12 @@ with st.sidebar:
                                     placeholder="COM3 or /dev/ttyUSB0")
         serial_baud = st.number_input("Baud rate", value=115200, step=9600)
 
+    st.markdown("**Vehicle / Sensor**")
+    vehicle_speed = st.slider("Vehicle speed (km/h)", 1, 120, 30, step=1,
+                              help="Used to estimate pothole width/length")
+    sample_rate   = st.slider("LiDAR sample rate (Hz)", 1, 100, 10, step=1,
+                              help="How many readings per second")
+
     st.markdown("**Adaptive Baseline**")
     ma_window    = st.slider("MA window (readings)",  10, 60,
                              ADAPT_MA_WINDOW, step=5)
@@ -324,8 +402,8 @@ st.markdown("""
 
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_live, tab_log, tab_stats = st.tabs(
-    ["📡 Live Detection", "📋 Detection Log", "📊 Model Stats"]
+tab_live, tab_events, tab_log, tab_stats = st.tabs(
+    ["📡 Live Detection", "🕳️ Pothole Events", "📋 Detection Log", "📊 Model Stats"]
 )
 
 
@@ -406,6 +484,7 @@ with tab_live:
         st.session_state["baselines"] = []
         st.session_state["results"]   = []
         st.session_state["alerts"]    = []
+        st.session_state["events"]    = []
         st.session_state["total"]     = 0
         st.session_state["running"]   = False
         st.cache_resource.clear()
@@ -443,9 +522,15 @@ with tab_live:
             st.session_state[key] = st.session_state[key][-500:]
         st.session_state["results"] = st.session_state["results"][-500:]
 
+        # ── Extract pothole/bump events ──────────────────────────────────
+        st.session_state["events"] = _extract_events(
+            st.session_state["results"], vehicle_speed, sample_rate
+        )
+
     # ── KPIs ────────────────────────────────────────────────────────────
     results = st.session_state["results"]
     latest  = results[-1] if results else None
+    events  = st.session_state["events"]
 
     k1, k2, k3, k4 = st.columns(4)
     with k1:
@@ -521,6 +606,43 @@ with tab_live:
         i4.metric("MA Deviation",
                   f"{latest.get('ma_deviation_cm', 0):+.2f} cm")
 
+    # ── Latest event info ────────────────────────────────────────────────
+    if events:
+        st.markdown("#### 🕳️ Latest Detected Event")
+        ev = events[-1]
+        ev_type_col = CLASS_COLORS.get(ev["type_id"], "#8b949e")
+        e1, e2, e3, e4, e5 = st.columns(5)
+        with e1:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Type</h3>
+              <p class="val" style="color:{ev_type_col};">{ev['type']}</p>
+              <p class="sub">{ev['severity']}</p>
+            </div>""", unsafe_allow_html=True)
+        with e2:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Max Depth</h3>
+              <p class="val">{ev['max_depth_cm']} cm</p>
+              <p class="sub">Avg: {ev['avg_depth_cm']} cm</p>
+            </div>""", unsafe_allow_html=True)
+        with e3:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Width / Length</h3>
+              <p class="val">{ev['width_cm']} cm</p>
+              <p class="sub">{ev['width_m']} m</p>
+            </div>""", unsafe_allow_html=True)
+        with e4:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Duration</h3>
+              <p class="val">{ev['n_readings']} rdgs</p>
+              <p class="sub">{ev['n_readings'] / max(sample_rate, 1):.2f} sec</p>
+            </div>""", unsafe_allow_html=True)
+        with e5:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Total Events</h3>
+              <p class="val" style="color:#f85149;">{len(events)}</p>
+              <p class="sub">Potholes + Bumps</p>
+            </div>""", unsafe_allow_html=True)
+
     # ── Auto-rerun for continuous streaming ───────────────────────────
     if st.session_state["running"]:
         time.sleep(stream_speed / 1000.0)
@@ -528,12 +650,124 @@ with tab_live:
 
 
 # ╔═══════════════════════════════════════════════════════╗
-# ║  TAB 2 — Detection Log                                ║
+# ║  TAB 2 — Pothole Events                               ║
+# ╚═══════════════════════════════════════════════════════╝
+with tab_events:
+    ev_list = st.session_state["events"]
+    if not ev_list:
+        st.info("No pothole or speed-bump events detected yet. "
+                "Click ▶ Start on the Live Detection tab.")
+    else:
+        # Summary KPIs
+        n_potholes = sum(1 for e in ev_list if e["type_id"] in (1, 2))
+        n_bumps    = sum(1 for e in ev_list if e["type_id"] == 3)
+        deepest    = max(e["max_depth_cm"] for e in ev_list)
+        widest     = max(e["width_cm"] for e in ev_list)
+
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Potholes Found</h3>
+              <p class="val" style="color:#f85149;">{n_potholes}</p>
+            </div>""", unsafe_allow_html=True)
+        with s2:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Speed Bumps</h3>
+              <p class="val" style="color:#58a6ff;">{n_bumps}</p>
+            </div>""", unsafe_allow_html=True)
+        with s3:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Deepest</h3>
+              <p class="val">{deepest} cm</p>
+            </div>""", unsafe_allow_html=True)
+        with s4:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Widest</h3>
+              <p class="val">{widest} cm</p>
+              <p class="sub">{widest / 100:.2f} m</p>
+            </div>""", unsafe_allow_html=True)
+
+        # Detailed events table
+        st.markdown("#### Detected Events")
+        ev_df = pd.DataFrame([{
+            "#"            : e["event_id"],
+            "Type"         : e["type"],
+            "Severity"     : e["severity"],
+            "Max Depth (cm)": e["max_depth_cm"],
+            "Avg Depth (cm)": e["avg_depth_cm"],
+            "Width (cm)"   : e["width_cm"],
+            "Width (m)"    : e["width_m"],
+            "Duration (rdgs)": e["n_readings"],
+            "Conf (%)"     : round(e["confidence"] * 100, 1),
+        } for e in ev_list])
+
+        st.dataframe(ev_df, use_container_width=True, height=350)
+
+        # Depth vs Width scatter
+        st.markdown("#### Depth vs Width")
+        sc_df = pd.DataFrame([{
+            "Max Depth (cm)": e["max_depth_cm"],
+            "Width (cm)"    : e["width_cm"],
+            "Type"          : e["type"],
+            "Severity"      : e["severity"],
+        } for e in ev_list])
+        fig_sc = px.scatter(
+            sc_df, x="Width (cm)", y="Max Depth (cm)",
+            color="Type",
+            size="Max Depth (cm)",
+            color_discrete_map={
+                CLASS_NAMES[1]: CLASS_COLORS[1],
+                CLASS_NAMES[2]: CLASS_COLORS[2],
+                CLASS_NAMES[3]: CLASS_COLORS[3],
+            },
+            hover_data=["Severity"],
+        )
+        fig_sc.update_layout(
+            paper_bgcolor=DARK_BG, plot_bgcolor=CARD_BG,
+            font=dict(color="#8b949e"),
+            height=350, margin=dict(l=50, r=20, t=30, b=30),
+        )
+        for ax in ["xaxis", "yaxis"]:
+            getattr(fig_sc.layout, ax).update(gridcolor=GRID_COL)
+        st.plotly_chart(fig_sc, use_container_width=True, key="ev_scatter")
+
+        # Event type pie
+        c1_ev, c2_ev = st.columns(2)
+        with c1_ev:
+            type_counts = sc_df["Type"].value_counts().reset_index()
+            type_counts.columns = ["Type", "Count"]
+            fig_tp = px.pie(type_counts, values="Count", names="Type",
+                           color_discrete_sequence=[
+                               "#f0e030", "#f85149", "#58a6ff"],
+                           hole=0.45)
+            fig_tp.update_layout(
+                paper_bgcolor=DARK_BG, font=dict(color="#8b949e"),
+                margin=dict(l=10, r=10, t=30, b=10),
+                title=dict(text="Event Types", font=dict(color="white")),
+            )
+            st.plotly_chart(fig_tp, use_container_width=True, key="ev_type_pie")
+        with c2_ev:
+            sev_counts = sc_df["Severity"].value_counts().reset_index()
+            sev_counts.columns = ["Severity", "Count"]
+            fig_sv = px.pie(sev_counts, values="Count", names="Severity",
+                           color_discrete_sequence=[
+                               "#2ea043", "#f0e030", "#f85149", "#8b949e"],
+                           hole=0.45)
+            fig_sv.update_layout(
+                paper_bgcolor=DARK_BG, font=dict(color="#8b949e"),
+                margin=dict(l=10, r=10, t=30, b=10),
+                title=dict(text="Severity Distribution", font=dict(color="white")),
+            )
+            st.plotly_chart(fig_sv, use_container_width=True, key="ev_sev_pie")
+
+
+# ╔═══════════════════════════════════════════════════════╗
+# ║  TAB 3 — Detection Log                                ║
 # ╚═══════════════════════════════════════════════════════╝
 with tab_log:
     results = st.session_state["results"]
     if not results:
-        st.info("No detections yet. Click ▶ Step in the Live Detection tab.")
+        st.info("No detections yet. Click ▶ Start in the Live Detection tab.")
     else:
         df = pd.DataFrame([{
             "Class"       : r["class_name"],
