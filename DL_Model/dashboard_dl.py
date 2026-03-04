@@ -95,6 +95,7 @@ def _init_state():
     defaults = {
         "readings"   : [],      # raw distance readings
         "strengths"  : [],
+        "baselines"  : [],      # adaptive baseline values
         "results"    : [],      # inference result dicts
         "alerts"     : [],      # alert events
         "running"    : False,
