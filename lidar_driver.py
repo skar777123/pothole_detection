@@ -208,64 +208,7 @@ class TF02Pro:
     def __exit__(self, *_): self.close()
 
 
-# ── Background reader thread ──────────────────────────────────────────────────
 
-class LiDARReaderThread:
-    """
-    Reads sensor at ~100Hz in background. Auto-recovers from dropouts.
-    Soft recovery (re-enable) after 3 errors.
-    Hard recovery (port reconnect) after 6 errors.
-    """
-
-    SOFT_AFTER = 3
-    HARD_AFTER = 6
-
-    def __init__(self, lidar: TF02Pro, maxlen=5):
-        self._lidar   = lidar
-        self._buf     = deque(maxlen=maxlen)
-        self._lock    = threading.Lock()
-        self._running = True
-        self.errors   = 0
-        self.frames   = 0
-        self._consec  = 0
-        self._thread  = threading.Thread(
-            target=self._loop, daemon=True, name="LiDARReader"
-        )
-        self._thread.start()
-
-    def _loop(self):
-        while self._running:
-            try:
-                frame = self._lidar.read_frame()
-                with self._lock:
-                    self._buf.append(frame)
-                self.frames += 1
-                self._consec = 0
-            except LiDARReadError as exc:
-                self.errors  += 1
-                self._consec += 1
-                logger.debug("Error #%d: %s", self._consec, exc)
-
-                if self._consec == self.SOFT_AFTER:
-                    logger.warning("Soft recovery …")
-                    self._lidar._enable_output()
-                elif self._consec >= self.HARD_AFTER:
-                    logger.warning("Hard reconnect …")
-                    self._lidar.reconnect()
-                    self._consec = 0
-
-                time.sleep(0.005)
-            except Exception as exc:
-                logger.error("Reader: %s", exc)
-                time.sleep(0.05)
-
-    def get_latest(self):
-        with self._lock:
-            return self._buf[-1] if self._buf else None
-
-    def stop(self):
-        self._running = False
-        self._thread.join(timeout=1.0)
 
 
 def list_ports():

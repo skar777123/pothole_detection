@@ -3,15 +3,11 @@ dashboard.py
 =============
 Real-time Pothole Detection — TF02-Pro LiDAR
 
-ARCHITECTURE
-────────────
-  Background thread (LiDARReaderThread):
-    • Reads sensor at 100 Hz continuously
-    • Always drains the serial buffer — zero accumulation lag
-    • Stores latest frame in a thread-safe ring buffer
-
-  Main Streamlit loop:
-    • Calls reader.get_latest()  ← instant, no serial I/O
+  Main Streamlit loop (Synchronous):
+    • Reads directly from serial sensor inside the main loop
+    • Drains buffer automatically on reads
+    • Runs detection logic every frame
+    • Updates UI at 10 Hz (throttled) to reduce re-render overhead
     • Runs detection logic every frame
     • Updates UI at 10 Hz (throttled) to reduce re-render overhead
     • Detection ALERTS fire immediately (bypass UI throttle)
@@ -28,7 +24,7 @@ import logging
 from collections import deque
 
 from lidar_driver import (
-    TF02Pro, LiDARReadError, LiDARReaderThread,
+    TF02Pro, LiDARReadError,
     list_ports, FRAME_LEN,
 )
 from model_train import (
@@ -149,9 +145,9 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🔄 Reset All (and Stop Sensor)"):
-        close_global_lidar()
         for k, v in _defaults.items():
             st.session_state[k] = v
+        st.session_state.running = False
         st.rerun()
 
 
@@ -243,47 +239,12 @@ def show_diagnostic():
                 st.error(f"❌ {exc}")
 
 
-# ── Global LiDAR Connection Pool ──────────────────────────────────────────────
-# Streamlit clears session_state on page refresh. To prevent zombie daemon threads
-# from permanently locking the COM port, we use a true process-global cache.
-import sys
-if "LIDAR_HOLDER" not in sys.modules:
-    sys.modules["LIDAR_HOLDER"] = {}
-
-def get_or_create_lidar(port, baud, send_init):
-    holder = sys.modules["LIDAR_HOLDER"]
-    
-    # If a connection exists but for a different port/baud, close it first
-    if "lidar" in holder:
-        old_l = holder["lidar"]
-        if old_l.port != port or old_l.baudrate != baud:
-            close_global_lidar()
-        elif holder["lidar"].connected:
-            return holder["lidar"], holder["reader"]
-
-    # Create new connection
-    lidar = TF02Pro(port=port, baudrate=baud, send_init=send_init)
-    reader = LiDARReaderThread(lidar, maxlen=5)
-    holder["lidar"] = lidar
-    holder["reader"] = reader
-    return lidar, reader
-
-def close_global_lidar():
-    holder = sys.modules["LIDAR_HOLDER"]
-    if "reader" in holder:
-        try: holder["reader"].stop()
-        except Exception: pass
-    if "lidar" in holder:
-        try: holder["lidar"].close()
-        except Exception: pass
-    holder.clear()
-
 # ── Main detection loop ───────────────────────────────────────────────────────
 
 def run_detection(model):
     # ── Open LiDAR ───────────────────────────────────────────────────────────
     try:
-        lidar, reader = get_or_create_lidar(lidar_port, lidar_baud, send_init)
+        lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud, send_init=send_init)
     except Exception as exc:
         st.error(f"❌ Cannot open `{lidar_port}`: {exc}")
         st.session_state.running = False
@@ -294,7 +255,7 @@ def run_detection(model):
     hdr_l, hdr_r = st.columns([6, 1])
     hdr_l.success(
         f"✅ **Streaming** `{lidar_port}` @ {lidar_baud} baud  "
-        f"| Background thread: 100 Hz"
+        f"| Direct synchronous polling"
     )
     stop_btn = hdr_r.button("⏹ Stop")
 
@@ -323,25 +284,40 @@ def run_detection(model):
     last_ui_t = 0.0
     UI_INTERVAL = 0.10     # update UI at 10 Hz
     no_data_count = 0
+    frames_count = 0
+    errors_count = 0
+    consec_errors = 0
 
-    logger.info("Detection started (background thread). Baseline=%.1f cm",
-                st.session_state.baseline_cm)
+    logger.info("Detection started (synchronous). Baseline=%.1f cm",
+                st.session_state.baseline_cm if st.session_state.baseline_cm else 0.0)
 
     try:
         # ── Main loop ─────────────────────────────────────────────────────────────
         while not stop_btn:
 
-            # ── GET LATEST FRAME from background thread (instant, no serial I/O) ──
-            frame = reader.get_latest()
-
-            if frame is None:
+            # ── GET LATEST FRAME directly from serial ──
+            try:
+                frame = lidar.read_frame_current()
+                frames_count += 1
+                consec_errors = 0
+            except LiDARReadError as exc:
+                errors_count += 1
+                consec_errors += 1
                 no_data_count += 1
-                # Show retry status — keep trying indefinitely (don't stop)
+
+                if consec_errors == 3:
+                    logger.warning("Soft recovery …")
+                    lidar._enable_output()
+                elif consec_errors >= 6:
+                    logger.warning("Hard reconnect …")
+                    lidar.reconnect()
+                    consec_errors = 0
+
                 status_ph.warning(
                     f"⏳ Waiting for sensor frames …  "
-                    f"Poll #{no_data_count} | Thread errors: {reader.errors} | "
-                    f"Thread frames: {reader.frames}  \n\n"
-                    f"{'🔴 Sensor silent — check USB connection & power' if reader.errors > 10 else '🟡 Starting up …'}"
+                    f"Poll #{no_data_count} | Errors: {errors_count} | "
+                    f"Frames: {frames_count}  \n\n"
+                    f"{'🔴 Sensor silent — check USB connection & power' if consec_errors > 4 else '🟡 Reading error …'}"
                 )
                 time.sleep(0.05)
                 continue
@@ -513,8 +489,8 @@ def run_detection(model):
                 }))
 
                 stats_ph.caption(
-                    f"Thread frames: **{reader.frames}** | "
-                    f"Thread errors: **{reader.errors}** | "
+                    f"Sensor frames: **{frames_count}** | "
+                    f"Read errors: **{errors_count}** | "
                     f"Window: {len(dist_buf)}/{WINDOW_SIZE} | "
                     f"Streak: {st.session_state.confirm_streak}/{confirm_n} | "
                     f"Cooldown: {cooldown_s:.0f}s"
@@ -533,13 +509,15 @@ def run_detection(model):
 
     finally:
         # ── Cleanup ────────────────────────────────────────────────────────
-        # Do NOT close the global port here, because Streamlit 'RerunException' 
-        # hits this when you click a slider. The port stays open in the background!
-        pass
+        # Due to Streamlit RerunExceptions triggered by UI interaction, 
+        # this block perfectly ensures the serial port is closed.
+        try:
+            lidar.close()
+        except Exception:
+            pass
         
     # Only close if user explicitly clicked the Stop button
     if stop_btn:
-        close_global_lidar()
         st.session_state.running = False
         st.info("⏹ Stopped.")
 
