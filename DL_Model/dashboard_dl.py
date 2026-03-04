@@ -99,7 +99,7 @@ def _init_state():
         "results"    : [],      # inference result dicts
         "alerts"     : [],      # alert events
         "events"     : [],      # detected pothole/bump events with dimensions
-        "running"    : False,
+        "running"    : True,
         "total"      : 0,
         "detector"   : None,
     }
@@ -357,8 +357,9 @@ with st.sidebar:
                               help="How many readings per second")
 
     st.markdown("**Adaptive Baseline**")
-    ma_window    = st.slider("MA window (readings)",  10, 60,
-                             ADAPT_MA_WINDOW, step=5)
+    calibration_n = st.slider("Calibration readings",  10, 50, 20, step=5,
+                              help="First N readings build the baseline")
+    ma_window    = calibration_n     # MA window = calibration count
     min_dur      = st.slider("Min duration (readings)", 1, 10,
                              ADAPT_MIN_DURATION, step=1)
 
@@ -443,41 +444,28 @@ def _read_serial_batch(port: str, baud: int, n: int) -> list[tuple[float, float]
 
 
 # ╔═══════════════════════════════════════════════════════╗
-# ║  TAB 1 — Live Detection                               ║
+# ║  TAB 1 — Live Detection  (fully continuous)           ║
 # ╚═══════════════════════════════════════════════════════╝
 with tab_live:
-    # ── Control buttons ──────────────────────────────────────────────────
-    col_c1, col_c2, col_c3, col_c4 = st.columns([1, 1, 1, 2])
-    with col_c1:
-        if st.session_state["running"]:
-            stop_btn = st.button("⏹ Stop", use_container_width=True,
-                                 type="primary")
-            if stop_btn:
-                st.session_state["running"] = False
-                st.rerun()
+    total    = st.session_state["total"]
+    cal_done = total >= calibration_n       # baseline calibration finished?
+
+    # ── Status bar + Reset ───────────────────────────────────────────────
+    col_st, col_rst = st.columns([4, 1])
+    with col_rst:
+        reset_btn = st.button("🔄 Recalibrate", use_container_width=True)
+    with col_st:
+        if not cal_done:
+            pct = min(total / calibration_n, 1.0)
+            st.progress(pct,
+                        text=f"📡 Calibrating baseline … {total}/{calibration_n} readings")
         else:
-            start_btn = st.button("▶ Start", use_container_width=True,
-                                  type="primary")
-            if start_btn:
-                st.session_state["running"] = True
-                st.rerun()
-    with col_c2:
-        step_btn = st.button("⏭ Step", use_container_width=True,
-                             disabled=st.session_state["running"])
-    with col_c3:
-        reset_btn = st.button("🔄 Reset", use_container_width=True)
-    with col_c4:
-        if st.session_state["running"]:
             st.markdown(
                 '<span style="color:#2ea043;font-weight:700;font-size:16px;">'
-                '🟢 STREAMING …</span>', unsafe_allow_html=True)
-        else:
-            st.markdown(
-                '<span style="color:#8b949e;font-size:16px;">'
-                '⏸ Paused — click <b>▶ Start</b></span>',
-                unsafe_allow_html=True)
+                f'🟢 LIVE — Baseline locked ({calibration_n} readings)  |  '
+                f'Total: {total} readings</span>', unsafe_allow_html=True)
 
-    # ── Reset handler ────────────────────────────────────────────────────
+    # ── Reset / Recalibrate ──────────────────────────────────────────────
     if reset_btn:
         st.session_state["readings"]  = []
         st.session_state["strengths"] = []
@@ -486,83 +474,86 @@ with tab_live:
         st.session_state["alerts"]    = []
         st.session_state["events"]    = []
         st.session_state["total"]     = 0
-        st.session_state["running"]   = False
+        st.session_state["running"]   = True
         st.cache_resource.clear()
         st.rerun()
 
-    # ── Process one batch (shared by Step and continuous mode) ───────
-    should_process = step_btn or st.session_state["running"]
+    # ── Always process a batch (continuous) ──────────────────────────────
+    detector = _get_detector(conf_thresh, alert_depth,
+                             ma_window, min_dur,
+                             use_model and model_ok)
 
-    if should_process:
-        detector = _get_detector(conf_thresh, alert_depth,
-                                 ma_window, min_dur,
-                                 use_model and model_ok)
+    # Get readings from the selected source
+    if data_source == "Serial LiDAR" and serial_port:
+        pairs = _read_serial_batch(serial_port, serial_baud,
+                                   steps_per_click)
+    else:
+        pairs = [_next_sim_reading(detector.baseline)
+                 for _ in range(steps_per_click)]
 
-        # Get readings from the selected source
-        if data_source == "Serial LiDAR" and serial_port:
-            pairs = _read_serial_batch(serial_port, serial_baud,
-                                       steps_per_click)
-        else:
-            pairs = [_next_sim_reading(detector.baseline)
-                     for _ in range(steps_per_click)]
+    for dist, strn in pairs:
+        st.session_state["readings"].append(dist)
+        st.session_state["strengths"].append(strn)
+        st.session_state["baselines"].append(detector.baseline)
+        st.session_state["total"] += 1
+        result = detector.feed(dist, strn)
+        if result:
+            st.session_state["results"].append(result)
+            if result["alert"]:
+                st.session_state["alerts"].append(result)
 
-        for dist, strn in pairs:
-            st.session_state["readings"].append(dist)
-            st.session_state["strengths"].append(strn)
-            st.session_state["baselines"].append(detector.baseline)
-            st.session_state["total"] += 1
-            result = detector.feed(dist, strn)
-            if result:
-                st.session_state["results"].append(result)
-                if result["alert"]:
-                    st.session_state["alerts"].append(result)
+    # Keep only the last 500 entries to avoid memory bloat
+    for key in ("readings", "strengths", "baselines"):
+        st.session_state[key] = st.session_state[key][-500:]
+    st.session_state["results"] = st.session_state["results"][-500:]
 
-        # Keep only the last 500 entries to avoid memory bloat
-        for key in ("readings", "strengths", "baselines"):
-            st.session_state[key] = st.session_state[key][-500:]
-        st.session_state["results"] = st.session_state["results"][-500:]
+    # ── Extract pothole/bump events ──────────────────────────────────
+    st.session_state["events"] = _extract_events(
+        st.session_state["results"], vehicle_speed, sample_rate
+    )
 
-        # ── Extract pothole/bump events ──────────────────────────────────
-        st.session_state["events"] = _extract_events(
-            st.session_state["results"], vehicle_speed, sample_rate
-        )
+    # Refresh total after processing
+    total    = st.session_state["total"]
+    cal_done = total >= calibration_n
 
-    # ── KPIs ────────────────────────────────────────────────────────────
+    # ── KPIs (only show after calibration) ──────────────────────────────
     results = st.session_state["results"]
     latest  = results[-1] if results else None
     events  = st.session_state["events"]
 
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        class_name = latest["class_name"] if latest else "—"
-        cls_id     = latest["class_id"]   if latest else -1
-        col        = CLASS_COLORS.get(cls_id, "#8b949e")
-        st.markdown(f"""<div class="metric-card">
-          <h3>Current Class</h3>
-          <p class="val" style="color:{col};">{class_name}</p>
-          <p class="sub">{'⚠️ ALERT' if (latest and latest['alert']) else 'OK'}</p>
-        </div>""", unsafe_allow_html=True)
-    with k2:
-        depth = f"{latest['depth_cm']:.1f} cm" if latest else "—"
-        st.markdown(f"""<div class="metric-card">
-          <h3>Depth</h3>
-          <p class="val">{depth}</p>
-          <p class="sub">{latest['severity'] if latest else ''}</p>
-        </div>""", unsafe_allow_html=True)
-    with k3:
-        conf = f"{latest['confidence']*100:.1f}%" if latest else "—"
-        st.markdown(f"""<div class="metric-card">
-          <h3>Confidence</h3>
-          <p class="val">{conf}</p>
-          <p class="sub">Model certainty</p>
-        </div>""", unsafe_allow_html=True)
-    with k4:
-        n_alerts = len(st.session_state["alerts"])
-        st.markdown(f"""<div class="metric-card">
-          <h3>Total Alerts</h3>
-          <p class="val" style="color:#f85149;">{n_alerts}</p>
-          <p class="sub">of {st.session_state['total']} readings</p>
-        </div>""", unsafe_allow_html=True)
+    if cal_done and latest:
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            class_name = latest["class_name"]
+            cls_id     = latest["class_id"]
+            col        = CLASS_COLORS.get(cls_id, "#8b949e")
+            st.markdown(f"""<div class="metric-card">
+              <h3>Current Class</h3>
+              <p class="val" style="color:{col};">{class_name}</p>
+              <p class="sub">{'⚠️ ALERT' if latest['alert'] else 'OK'}</p>
+            </div>""", unsafe_allow_html=True)
+        with k2:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Depth</h3>
+              <p class="val">{latest['depth_cm']:.1f} cm</p>
+              <p class="sub">{latest['severity']}</p>
+            </div>""", unsafe_allow_html=True)
+        with k3:
+            st.markdown(f"""<div class="metric-card">
+              <h3>Confidence</h3>
+              <p class="val">{latest['confidence']*100:.1f}%</p>
+              <p class="sub">{'DL Model' if use_model and model_ok else 'Rule-Based'}</p>
+            </div>""", unsafe_allow_html=True)
+        with k4:
+            n_alerts = len(st.session_state["alerts"])
+            st.markdown(f"""<div class="metric-card">
+              <h3>Total Alerts</h3>
+              <p class="val" style="color:#f85149;">{n_alerts}</p>
+              <p class="sub">Baseline: {latest['baseline_cm']:.1f} cm</p>
+            </div>""", unsafe_allow_html=True)
+    elif not cal_done:
+        st.info(f"⏳ Calibrating … collecting {calibration_n} readings "
+                "to establish the baseline distance. Detection will start automatically.")
 
     # Alert banner
     if latest and latest["alert"]:
