@@ -476,8 +476,31 @@ class AdaptiveDetector:
                 confirmed, run_len
             )
 
-        # ── Sanity guard ─────────────────────────────────────────────────────
-        # Override model/rule classification if the actual deviation is too
+        # ── Sanity guard & Forced Overrides ──────────────────────────────────
+        # 1. Override model classification if the actual deviation is too small
+        # (prevents LiDAR noise from being classified as anomalies).
+        cls = result["class_id"]
+        if cls in (1, 2) and ma_dev < POTHOLE_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / POTHOLE_THRESH), 4)
+        elif cls == 3 and ma_dev > -BUMP_THRESH:
+            result["class_id"]   = 0
+            result["class_name"] = CLASS_NAMES[0]
+            result["confidence"] = round(max(0.0, 1.0 - abs_dev / BUMP_THRESH), 4)
+            
+        # 2. Forced Anomaly Override: If the DL model is confused by an extremely 
+        # sudden, massive deviation (like a hand blocking the sensor) and predicts 
+        # "Flat Road", we FORCE the class to the correct anomaly type.
+        if confirmed and result["class_id"] == 0:
+            if ma_dev > POTHOLE_THRESH * 2:  # Huge positive deviation (deep pothole)
+                result["class_id"] = 2
+                result["class_name"] = CLASS_NAMES[2]
+                result["confidence"] = 0.99
+            elif ma_dev < -BUMP_THRESH:      # Moderate/Huge negative deviation (bump/hand)
+                result["class_id"] = 3
+                result["class_name"] = CLASS_NAMES[3]
+                result["confidence"] = 0.99
         # small — prevents LiDAR noise from being classified as anomalies.
         cls = result["class_id"]
         if cls in (1, 2) and ma_dev < POTHOLE_THRESH:

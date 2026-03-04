@@ -118,7 +118,7 @@ def _extract_events(results: list[dict],
     Scan results and group consecutive anomalous readings into discrete
     pothole / speed-bump events with dimension estimates.
 
-    Width formula:  width_cm = n_readings × (speed_cm_per_sec / sample_rate_hz)
+    Length formula:  length_cm = n_readings × (speed_cm_per_sec / sample_rate_hz)
     """
     if not results:
         return []
@@ -144,7 +144,7 @@ def _extract_events(results: list[dict],
             depths = [er["depth_cm"] for er in event_readings]
             max_depth = max(depths)
             avg_depth = sum(depths) / n
-            width_cm  = round(n * cm_per_reading, 1)
+            length_cm  = round(n * cm_per_reading, 1)
 
             # Determine dominant type
             type_counts = {1: 0, 2: 0, 3: 0}
@@ -166,8 +166,8 @@ def _extract_events(results: list[dict],
                 "n_readings"   : n,
                 "max_depth_cm" : round(max_depth, 1),
                 "avg_depth_cm" : round(avg_depth, 1),
-                "width_cm"     : width_cm,
-                "width_m"      : round(width_cm / 100, 2),
+                "length_cm"    : length_cm,
+                "length_m"     : round(length_cm / 100, 2),
                 "severity"     : severity,
                 "confidence"   : round(
                     sum(er["confidence"] for er in event_readings) / n, 4),
@@ -618,9 +618,9 @@ with tab_live:
                 </div>""", unsafe_allow_html=True)
             with e3:
                 st.markdown(f"""<div class="metric-card">
-                  <h3>Width / Length</h3>
-                  <p class="val">{ev['width_cm']} cm</p>
-                  <p class="sub">{ev['width_m']} m</p>
+                  <h3>Length | Width</h3>
+                  <p class="val">{ev['length_cm']} cm</p>
+                  <p class="sub">W: Unk (1D Sensor)</p>
                 </div>""", unsafe_allow_html=True)
             with e4:
                 st.markdown(f"""<div class="metric-card">
@@ -653,7 +653,7 @@ with tab_events:
         n_potholes = sum(1 for e in ev_list if e["type_id"] in (1, 2))
         n_bumps    = sum(1 for e in ev_list if e["type_id"] == 3)
         deepest    = max(e["max_depth_cm"] for e in ev_list)
-        widest     = max(e["width_cm"] for e in ev_list)
+        longest     = max(e["length_cm"] for e in ev_list)
 
         s1, s2, s3, s4 = st.columns(4)
         with s1:
@@ -673,9 +673,9 @@ with tab_events:
             </div>""", unsafe_allow_html=True)
         with s4:
             st.markdown(f"""<div class="metric-card">
-              <h3>Widest</h3>
-              <p class="val">{widest} cm</p>
-              <p class="sub">{widest / 100:.2f} m</p>
+              <h3>Longest Event</h3>
+              <p class="val">{longest} cm</p>
+              <p class="sub">{longest / 100:.2f} m</p>
             </div>""", unsafe_allow_html=True)
 
         # Detailed events table
@@ -686,24 +686,24 @@ with tab_events:
             "Severity"     : e["severity"],
             "Max Depth (cm)": e["max_depth_cm"],
             "Avg Depth (cm)": e["avg_depth_cm"],
-            "Width (cm)"   : e["width_cm"],
-            "Width (m)"    : e["width_m"],
+            "Length (cm)"  : e["length_cm"],
+            "Width (cm)"   : "Unk (1D)",
             "Duration (rdgs)": e["n_readings"],
             "Conf (%)"     : round(e["confidence"] * 100, 1),
         } for e in ev_list])
 
         st.dataframe(ev_df, use_container_width=True, height=350)
 
-        # Depth vs Width scatter
-        st.markdown("#### Depth vs Width")
+        # Depth vs Length scatter
+        st.markdown("#### Depth vs Length")
         sc_df = pd.DataFrame([{
             "Max Depth (cm)": e["max_depth_cm"],
-            "Width (cm)"    : e["width_cm"],
+            "Length (cm)"   : e["length_cm"],
             "Type"          : e["type"],
             "Severity"      : e["severity"],
         } for e in ev_list])
         fig_sc = px.scatter(
-            sc_df, x="Width (cm)", y="Max Depth (cm)",
+            sc_df, x="Length (cm)", y="Max Depth (cm)",
             color="Type",
             size="Max Depth (cm)",
             color_discrete_map={
