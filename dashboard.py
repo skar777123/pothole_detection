@@ -138,9 +138,9 @@ with st.sidebar:
     max_plausible = st.number_input("Max Plausible Deviation (cm)", 10.0, 100.0,
                                   value=15.0, step=1.0,
                                   help="Ignore physically impossible deep potholes or tall bumps (e.g. >15cm) caused by sensor glitches.")
-    confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
-    cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
-                                  value=DETECTION_COOLDOWN_S, step=0.5)
+    # confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
+    # cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
+    #                               value=DETECTION_COOLDOWN_S, step=0.5)
 
     st.markdown("---")
     st.subheader("🚗 Vehicle Speed")
