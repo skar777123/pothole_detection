@@ -138,9 +138,9 @@ with st.sidebar:
     max_plausible = st.number_input("Max Plausible Deviation (cm)", 10.0, 100.0,
                                   value=15.0, step=1.0,
                                   help="Ignore physically impossible deep potholes or tall bumps (e.g. >15cm) caused by sensor glitches.")
-    # confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
-    # cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
-    #                               value=DETECTION_COOLDOWN_S, step=0.5)
+    confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 1)
+    cooldown_s  = st.number_input("Cooldown (s)", 0.1, 30.0,
+                                  value=max(0.1, DETECTION_COOLDOWN_S / 5), step=0.1)
 
     st.markdown("---")
     st.subheader("🚗 Vehicle Speed")
@@ -174,11 +174,12 @@ def rule_classify(dist_buf, baseline, max_plausible):
     Requires deviations to be present across multiple consecutive frames to 
     reject sudden one-frame noise spikes.
     """
-    if len(dist_buf) < 3:
+    if len(dist_buf) < 2:
         return 0
         
-    # Check the last 3 readings to ensure the spike is sustained (not noise)
-    recent_devs = np.array(dist_buf[-3:]) - baseline
+    # Check the last 2 readings (0.02s at 100Hz) to ensure the spike is sustained (not noise)
+    # This allows for extremely fast confirmations of real potholes
+    recent_devs = np.array(dist_buf[-2:]) - baseline
     
     # Check for physiologically impossible values (extreme sensor noise tracking)
     # If the reading shows a crater > 40cm deep or a bump > 40cm high, it's noise
