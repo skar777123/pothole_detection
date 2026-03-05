@@ -135,6 +135,9 @@ with st.sidebar:
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
                                   value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
                                   help="Negative deviation to trigger speed bump.")
+    max_plausible = st.number_input("Max Plausible Deviation (cm)", 20.0, 200.0,
+                                  value=40.0, step=5.0,
+                                  help="Ignore physically impossible deep potholes or tall bumps (e.g. >40cm) caused by sensor glitches.")
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
     cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
                                   value=DETECTION_COOLDOWN_S, step=0.5)
@@ -165,7 +168,7 @@ def severity_label(depth_cm):
     return "—"
 
 
-def rule_classify(dist_buf, baseline):
+def rule_classify(dist_buf, baseline, max_plausible):
     """
     Evaluates the recent history of distances to classify the road state.
     Requires deviations to be present across multiple consecutive frames to 
@@ -176,6 +179,11 @@ def rule_classify(dist_buf, baseline):
         
     # Check the last 3 readings to ensure the spike is sustained (not noise)
     recent_devs = np.array(dist_buf[-3:]) - baseline
+    
+    # Check for physiologically impossible values (extreme sensor noise tracking)
+    # If the reading shows a crater > 40cm deep or a bump > 40cm high, it's noise
+    if np.any(np.abs(recent_devs) > max_plausible):
+        return 0
     
     # If ANY of the last 3 readings are near zero (flat road), 
     # then the spike was instantaneous noise. Ignore it.
@@ -397,7 +405,7 @@ def run_detection(model):
                 str_buf.pop(0)
 
             # ── Classify ──────────────────────────────────────────────────────────
-            rule_cls = rule_classify(dist_buf, baseline)
+            rule_cls = rule_classify(dist_buf, baseline, max_plausible)
             
             ml_conf = 0.0
             final_cls = rule_cls
