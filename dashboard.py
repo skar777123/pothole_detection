@@ -88,6 +88,7 @@ _defaults = {
     "baseline_cm"       : None,          # None until first 20 readings arrive
     "rolling_baseline_buf": deque(maxlen=BASELINE_WINDOW),
     "calibrated"        : False,         # True once baseline_buf is full
+    "recalib_streak"    : 0,             # frames of continuous huge changes to force re-calibration
     "dist_buf"          : [],
     "str_buf"           : [],
     "last_detect_t"     : 0.0,
@@ -371,19 +372,22 @@ def run_detection(model):
                 time.sleep(0.02)
                 continue
 
-            # ── ROLLING BASELINE (mean of last 20 readings) ───────────────────────
-            st.session_state.rolling_baseline_buf.append(dist)
-            if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
-                st.session_state.baseline_cm  = float(
-                    np.mean(st.session_state.rolling_baseline_buf)
-                )
-                st.session_state.calibrated = True
-
+            # ── FIXED BASELINE LOGIC ──────────────────────────────────────────────────
+            # Skip out-of-range readings for calibration
+            if not st.session_state.calibrated:
+                st.session_state.rolling_baseline_buf.append(dist)
+                if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
+                    st.session_state.baseline_cm  = float(
+                        np.mean(st.session_state.rolling_baseline_buf)
+                    )
+                    st.session_state.calibrated = True
+                    st.session_state.recalib_streak = 0
+            
             # Skip detection until baseline is fully established
             if not st.session_state.calibrated:
                 _n = len(st.session_state.rolling_baseline_buf)
                 status_ph.info(
-                    f"⏳ Establishing baseline … ({_n}/{BASELINE_WINDOW} readings) "
+                    f"⏳ Establishing locked baseline … ({_n}/{BASELINE_WINDOW} readings) "
                     f"| Current dist: **{dist} cm**"
                 )
                 time.sleep(0.02)
@@ -391,6 +395,20 @@ def run_detection(model):
 
             baseline = st.session_state.baseline_cm
             dev      = dist - baseline
+            
+            # ── RECALIBRATION ON HUGE SHIFT ──────────────────────────────────────────
+            # If the road instantly drops or rises significantly and STAYS there
+            if abs(dev) > max_plausible:
+                st.session_state.recalib_streak += 1
+                if st.session_state.recalib_streak >= 50: # 0.5s of continuous huge dev
+                    status_ph.warning(f"🔄 Massive shift detected (>40cm). Recalibrating baseline...")
+                    st.session_state.calibrated = False
+                    st.session_state.rolling_baseline_buf.clear()
+                    st.session_state.recalib_streak = 0
+                    time.sleep(0.05)
+                    continue
+            else:
+                st.session_state.recalib_streak = 0
 
             # Update histories
             st.session_state.dist_history.append(dist)
