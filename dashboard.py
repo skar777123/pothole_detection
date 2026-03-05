@@ -136,7 +136,7 @@ with st.sidebar:
                                   value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
                                   help="Negative deviation to trigger speed bump.")
     max_plausible = st.number_input("Max Plausible Deviation (cm)", 20.0, 200.0,
-                                  value=40.0, step=5.0,
+                                  value=15.0, step=5.0,
                                   help="Ignore physically impossible deep potholes or tall bumps (e.g. >40cm) caused by sensor glitches.")
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 2)
     cooldown_s  = st.number_input("Cooldown (s)", 0.5, 30.0,
