@@ -137,7 +137,12 @@ class TF02Pro:
     # ── Frame reading ─────────────────────────────────────────────────────────
 
     def _read_bytes(self, n):
-        data = self._ser.read(n)
+        try:
+            data = self._ser.read(n)
+        except Exception as exc:
+            self.connected = False
+            raise LiDARReadError(f"Hardware drop: {exc}")
+            
         if len(data) != n:
             raise LiDARReadError(
                 f"Expected {n} bytes, got {len(data)} "
@@ -185,11 +190,17 @@ class TF02Pro:
 
     def read_frame_current(self):
         """Read latest frame — drains stale buffer if grown too large."""
-        if not self.connected or not self._ser.is_open:
+        if not self.connected or getattr(self, "_ser", None) is None or not self._ser.is_open:
             raise LiDARReadError("Port not open")
-        if self._ser.in_waiting > FRAME_LEN * 3:
-            self._ser.reset_input_buffer()
-            time.sleep(0.012)
+            
+        try:
+            if self._ser.in_waiting > FRAME_LEN * 3:
+                self._ser.reset_input_buffer()
+                time.sleep(0.012)
+        except Exception as exc:
+            self.connected = False
+            raise LiDARReadError(f"Hardware drop: {exc}")
+            
         return self.read_frame()
 
     def diagnostic_raw_dump(self, n_bytes=90):
