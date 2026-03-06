@@ -27,6 +27,7 @@ from lidar_driver import (
     TF02Pro, LiDARReadError,
     list_ports, FRAME_LEN,
 )
+from ultrasonic_driver import UltrasonicDriver
 from model_train import (
     extract_features, WINDOW_SIZE,
     POTHOLE_THRESH, BUMP_THRESH,
@@ -89,6 +90,9 @@ _defaults = {
     "rolling_baseline_buf": deque(maxlen=BASELINE_WINDOW),
     "calibrated"        : False,         # True once baseline_buf is full
     "recalib_streak"    : 0,             # frames of continuous huge changes to force re-calibration
+    "us_dist"           : 0.0,           # Latest ultrasonic reading
+    "us_baseline_cm"    : None,
+    "us_rolling_buf"    : deque(maxlen=BASELINE_WINDOW),
     "dist_buf"          : [],
     "str_buf"           : [],
     "last_detect_t"     : 0.0,
@@ -103,8 +107,10 @@ with st.sidebar:
     st.title("⚙️ Settings")
 
     available_ports = list_ports()
-    lidar_port = st.text_input("Serial Port", value="/dev/ttyUSB0",
+    lidar_port = st.text_input("LiDAR Port", value="/dev/ttyUSB0",
                                help="Linux: /dev/ttyUSB0  |  Windows: COM3")
+    esp32_cam_url = st.text_input("ESP32-CAM Stream URL", value="http://192.168.1.100:81/stream",
+                               help="Paste the IP Stream URL to view the live camera feed.")
     if available_ports:
         st.caption(f"Detected: `{'`, `'.join(available_ports)}`")
 
@@ -261,22 +267,22 @@ def show_diagnostic():
                 st.error(f"❌ Port error: {exc}")
 
     with c2:
-        if st.button("📡 Single Frame Test"):
-            try:
-                with st.spinner("Reading one frame …"):
-                    with TF02Pro(port=lidar_port, baudrate=lidar_baud,
-                                 timeout=0.5, send_init=send_init) as lidar:
-                        r = lidar.read_frame()
-                st.success("✅ Frame OK!")
-                st.json(r)
-            except Exception as exc:
-                st.error(f"❌ {exc}")
+        if esp32_cam_url:
+            st.markdown(f"**ESP32-CAM Live Feed:**")
+            st.markdown(
+                f'<img src="{esp32_cam_url}" width="100%" style="border-radius:10px; border:2px solid gray;">',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("ℹ️ Enter ESP32-CAM Stream URL in the sidebar to view video.")
 
 
 # ── Main detection loop ───────────────────────────────────────────────────────
 
 def run_detection(model):
-    # ── Open LiDAR ───────────────────────────────────────────────────────────
+    # ── Open LiDAR & Ultrasonic ─────────────────────────────────────────────
+    lidar = None
+    ultrasonic = None
     try:
         lidar = TF02Pro(port=lidar_port, baudrate=lidar_baud, send_init=send_init)
     except Exception as exc:
@@ -284,6 +290,13 @@ def run_detection(model):
         st.session_state.running = False
         show_diagnostic()
         return
+        
+    try:
+        ultrasonic = UltrasonicDriver(trig_pin=23, echo_pin=24)
+        status_ph = st.empty()
+        status_ph.success(f"✅ GPIO Ultrasonic Driver initialized.")
+    except Exception as exc:
+        st.warning(f"⚠️ Ultrasonic GPIO initialization failed: {exc}. Running LiDAR only.")
 
     # ── UI layout ─────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
@@ -293,11 +306,11 @@ def run_detection(model):
     )
     stop_btn = hdr_r.button("⏹ Stop")
 
-    kc = st.columns(8)
+    kc = st.columns(9)
     ph_base  = kc[0].empty(); ph_dist = kc[1].empty()
-    ph_dev   = kc[2].empty(); ph_str  = kc[3].empty()
-    ph_temp  = kc[4].empty(); ph_cnt  = kc[5].empty()
-    ph_bump  = kc[6].empty(); ph_dep  = kc[7].empty()
+    ph_us    = kc[2].empty(); ph_dev  = kc[3].empty(); ph_str  = kc[4].empty()
+    ph_temp  = kc[5].empty(); ph_cnt  = kc[6].empty()
+    ph_bump  = kc[7].empty(); ph_dep  = kc[8].empty()
 
     st.markdown("---")
     status_ph = st.empty()
@@ -330,7 +343,13 @@ def run_detection(model):
         # ── Main loop ─────────────────────────────────────────────────────────────
         while not stop_btn:
 
-            # ── GET LATEST FRAME directly from serial ──
+            # ── GET LATEST ULTRASONIC FRAME (Non-blocking) ──
+            if ultrasonic:
+                us_val = ultrasonic.read_frame_current()
+                if us_val is not None:
+                    st.session_state.us_dist = us_val
+
+            # ── GET LATEST LIDAR FRAME directly from serial ──
             try:
                 frame = lidar.read_frame_current()
                 frames_count += 1
@@ -376,10 +395,16 @@ def run_detection(model):
             # Skip out-of-range readings for calibration
             if not st.session_state.calibrated:
                 st.session_state.rolling_baseline_buf.append(dist)
+                if ultrasonic and st.session_state.us_dist > 0:
+                    st.session_state.us_rolling_buf.append(st.session_state.us_dist)
+                    
                 if len(st.session_state.rolling_baseline_buf) == BASELINE_WINDOW:
                     st.session_state.baseline_cm  = float(
                         np.mean(st.session_state.rolling_baseline_buf)
                     )
+                    if len(st.session_state.us_rolling_buf) > 0:
+                        st.session_state.us_baseline_cm = float(np.mean(st.session_state.us_rolling_buf))
+                        
                     st.session_state.calibrated = True
                     st.session_state.recalib_streak = 0
             
@@ -404,6 +429,7 @@ def run_detection(model):
                     status_ph.warning(f"🔄 Massive shift detected (>40cm). Recalibrating baseline...")
                     st.session_state.calibrated = False
                     st.session_state.rolling_baseline_buf.clear()
+                    st.session_state.us_rolling_buf.clear()
                     st.session_state.recalib_streak = 0
                     time.sleep(0.05)
                     continue
@@ -444,7 +470,23 @@ def run_detection(model):
             is_bump = IS_BUMP.get(final_cls, False)
 
             if is_ph or is_bump:
-                st.session_state.confirm_streak += 1
+                # ── SENSOR FUSION VERIFICATION ──
+                verified = True
+                
+                # If Ultrasonic is active and calibrated, require it to verify the anomaly
+                # US noise floor is slightly higher and footprint wider, so we check for > 2cm deviation
+                if ultrasonic and st.session_state.us_baseline_cm is not None and st.session_state.us_dist > 0:
+                    us_dev = st.session_state.us_dist - st.session_state.us_baseline_cm
+                    
+                    if is_ph and us_dev < 2.0:
+                        verified = False # LiDAR said hole, US didn't see it (likely puddle/reflective limit)
+                    elif is_bump and us_dev > -2.0:
+                        verified = False # LiDAR said bump, US didn't see it
+                        
+                if verified:
+                    st.session_state.confirm_streak += 1
+                else:
+                    st.session_state.confirm_streak = 0
             else:
                 st.session_state.confirm_streak = 0
 
@@ -484,6 +526,7 @@ def run_detection(model):
                         "Length (cm)": dims["length_cm"],
                         "Width (cm)" : dims["width_cm"],
                         "Severity"   : dims["severity"],
+                        "US (cm)"    : st.session_state.us_dist,
                         "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
                         "Strength"   : int(dims["avg_strength"]),
                         "Baseline"   : f"{baseline:.0f}",
@@ -523,7 +566,8 @@ def run_detection(model):
             now = time.monotonic()
             if now - last_ui_t >= UI_INTERVAL:
                 ph_base.metric("📐 Baseline",    f"{baseline:.0f} cm")
-                ph_dist.metric("📡 Distance",    f"{dist} cm")
+                ph_dist.metric("📡 LiDAR",    f"{dist} cm")
+                ph_us.metric("🔊 US Dist",      f"{st.session_state.us_dist} cm")
                 ph_dev.metric("↕️ Deviation",   f"{dev:+.1f} cm",
                               delta=f"{dev:+.1f}", delta_color="inverse")
                 ph_str.metric("📶 Strength",     strength)
@@ -568,6 +612,7 @@ def run_detection(model):
         # this block perfectly ensures the serial port is closed.
         try:
             lidar.close()
+            if ultrasonic: ultrasonic.close()
         except Exception:
             pass
         
