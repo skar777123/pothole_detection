@@ -466,6 +466,19 @@ def run_detection(model):
                     final_cls = ml_cls
                     ml_conf = rf_conf
 
+            # ── OFF-AXIS FUSION OVERRIDE ──
+            # The LiDAR beam is tiny (mm). The Ultrasonic is wide (cm).
+            # If you steer slightly off, LiDAR sees Flat Road, but Ultrasonic sees the Pothole.
+            # We override the Flat Road classification if Ultrasonic shows a massive deviation.
+            if final_cls == 0 and ultrasonic and st.session_state.us_baseline_cm is not None and st.session_state.us_dist > 0:
+                us_dev = st.session_state.us_dist - st.session_state.us_baseline_cm
+                if us_dev > 5.0: # > 5cm deep off-axis hole
+                    final_cls = 1
+                    ml_conf = 0.0 # Force override status
+                elif us_dev < -5.0: # > 5cm tall off-axis bump
+                    final_cls = 3
+                    ml_conf = 0.0
+
             is_ph   = IS_POTHOLE.get(final_cls, False)
             is_bump = IS_BUMP.get(final_cls, False)
 

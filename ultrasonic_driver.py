@@ -92,7 +92,7 @@ class UltrasonicDriver:
         while self.running:
             try:
                 dist = self._read_distance_cm()
-                if dist > 0 and dist < 400: # Max 4 meters
+                if dist > 0 and dist <= 1000: # Max 10 meters (1000cm)
                     self.latest_distance = dist
                 else:
                     self.latest_distance = -1.0 # Error flag
