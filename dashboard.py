@@ -28,6 +28,7 @@ from lidar_driver import (
     list_ports, FRAME_LEN,
 )
 from ultrasonic_driver import UltrasonicDriver
+from camera_driver import CameraDriver
 from model_train import (
     extract_features, WINDOW_SIZE,
     POTHOLE_THRESH, BUMP_THRESH,
@@ -142,9 +143,9 @@ with st.sidebar:
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
                                   value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
                                   help="Negative deviation to trigger speed bump.")
-    max_plausible = st.number_input("Max Plausible Deviation (cm)", 10.0, 100.0,
-                                  value=15.0, step=1.0,
-                                  help="Ignore physically impossible deep potholes or tall bumps (e.g. >15cm) caused by sensor glitches.")
+    max_plausible = st.number_input("Max Plausible Deviation (cm)", 10.0, 150.0,
+                                  value=60.0, step=1.0,
+                                  help="Ignore physically impossible deep potholes or tall bumps (e.g. >60cm) caused by sensor glitches.")
     confirm_n   = st.slider("Confirm streak (windows)", 1, 4, 1)
     cooldown_s  = st.number_input("Cooldown (s)", 0.1, 30.0,
                                   value=max(0.1, DETECTION_COOLDOWN_S / 5), step=0.1)
@@ -297,6 +298,13 @@ def run_detection(model):
         status_ph.success(f"✅ GPIO Ultrasonic Driver initialized.")
     except Exception as exc:
         st.warning(f"⚠️ Ultrasonic GPIO initialization failed: {exc}. Running LiDAR only.")
+        
+    camera = None
+    try:
+        camera = CameraDriver(port='/dev/serial0', baudrate=115200)
+        st.success("📸 Camera Driver initialized.")
+    except Exception as exc:
+        st.warning(f"⚠️ Camera Driver initialization failed: {exc}.")
 
     # ── UI layout ─────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
@@ -306,11 +314,11 @@ def run_detection(model):
     )
     stop_btn = hdr_r.button("⏹ Stop")
 
-    kc = st.columns(9)
+    kc = st.columns(10)
     ph_base  = kc[0].empty(); ph_dist = kc[1].empty()
-    ph_us    = kc[2].empty(); ph_dev  = kc[3].empty(); ph_str  = kc[4].empty()
-    ph_temp  = kc[5].empty(); ph_cnt  = kc[6].empty()
-    ph_bump  = kc[7].empty(); ph_dep  = kc[8].empty()
+    ph_us    = kc[2].empty(); ph_dev  = kc[3].empty(); ph_cam = kc[4].empty()
+    ph_str   = kc[5].empty(); ph_temp = kc[6].empty()
+    ph_cnt   = kc[7].empty(); ph_bump = kc[8].empty(); ph_dep = kc[9].empty()
 
     st.markdown("---")
     status_ph = st.empty()
@@ -481,11 +489,15 @@ def run_detection(model):
 
             is_ph   = IS_POTHOLE.get(final_cls, False)
             is_bump = IS_BUMP.get(final_cls, False)
+            cam_label = camera.get_latest_label() if camera else ""
 
             if is_ph or is_bump:
                 # ── SENSOR FUSION VERIFICATION ──
                 verified = True
                 
+                cam_pothole = "pothole" in cam_label.lower()
+                cam_bump = "bump" in cam_label.lower()
+
                 # If Ultrasonic is active and calibrated, require it to verify the anomaly
                 # US noise floor is slightly higher and footprint wider, so we check for > 2cm deviation
                 if ultrasonic and st.session_state.us_baseline_cm is not None and st.session_state.us_dist > 0:
@@ -495,6 +507,13 @@ def run_detection(model):
                         verified = False # LiDAR said hole, US didn't see it (likely puddle/reflective limit)
                     elif is_bump and us_dev > -2.0:
                         verified = False # LiDAR said bump, US didn't see it
+                        
+                # Camera confirmation verification
+                # If LiDAR and Ultrasonic are unsure or disagree with small margins, camera can veto
+                if camera and not (cam_pothole if is_ph else cam_bump):
+                    # Distance says anomaly, but camera doesn't confirm it
+                    if abs(dev) < 5.0: # small deviation, likely noise
+                        verified = False
                         
                 if verified:
                     st.session_state.confirm_streak += 1
@@ -540,6 +559,7 @@ def run_detection(model):
                         "Width (cm)" : dims["width_cm"],
                         "Severity"   : dims["severity"],
                         "US (cm)"    : st.session_state.us_dist,
+                        "Cam"        : cam_label if camera else "N/A",
                         "Conf."      : f"{ml_conf:.0%}" if ml_conf else "rule",
                         "Strength"   : int(dims["avg_strength"]),
                         "Baseline"   : f"{baseline:.0f}",
@@ -583,6 +603,7 @@ def run_detection(model):
                 ph_us.metric("🔊 US Dist",      f"{st.session_state.us_dist} cm")
                 ph_dev.metric("↕️ Deviation",   f"{dev:+.1f} cm",
                               delta=f"{dev:+.1f}", delta_color="inverse")
+                if camera: ph_cam.metric("📸 Cam", cam_label.split()[0] if cam_label else "N/A")
                 ph_str.metric("📶 Strength",     strength)
                 ph_temp.metric("🌡️ Temp",        f"{temp}°C")
                 ph_cnt.metric("🕳️ Potholes",    st.session_state.pothole_count)
@@ -626,6 +647,7 @@ def run_detection(model):
         try:
             lidar.close()
             if ultrasonic: ultrasonic.close()
+            if camera: camera.close()
         except Exception:
             pass
         
