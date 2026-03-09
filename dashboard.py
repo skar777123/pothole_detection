@@ -329,7 +329,11 @@ def run_detection(model):
     with col_cam:
         if esp32_cam_url:
             st.markdown(
-                f'<img src="{esp32_cam_url}" width="100%" style="border-radius:10px; border:2px solid gray; margin-bottom: 10px;">',
+                f'<a href="{esp32_cam_url}" target="_blank" title="Click to test Stream URL in new tab">'
+                f'<img src="{esp32_cam_url}" '
+                f'onerror="this.onerror=null; this.src=\'https://fakeimg.pl/640x360/282c34/ff0000/?text=Camera+Unreachable%0ACheck+IP+Address\';" '
+                f'width="100%" style="border-radius:10px; border:2px solid gray; margin-bottom: 10px;">'
+                f'</a>',
                 unsafe_allow_html=True,
             )
         else:
@@ -515,21 +519,27 @@ def run_detection(model):
                 cam_pothole = "pothole" in cam_label.lower()
                 cam_bump = "bump" in cam_label.lower()
 
-                # If Ultrasonic is active and calibrated, require it to verify the anomaly
-                # US noise floor is slightly higher and footprint wider, so we check for > 2cm deviation
+                us_agrees = False
+                us_contradicts = False
+                
                 if ultrasonic and st.session_state.us_baseline_cm is not None and st.session_state.us_dist > 0:
                     us_dev = st.session_state.us_dist - st.session_state.us_baseline_cm
                     
-                    if is_ph and us_dev < 2.0:
-                        verified = False # LiDAR said hole, US didn't see it (likely puddle/reflective limit)
-                    elif is_bump and us_dev > -2.0:
-                        verified = False # LiDAR said bump, US didn't see it
-                        
-                # Camera confirmation verification
-                # If LiDAR and Ultrasonic are unsure or disagree with small margins, camera can veto
-                if camera and not (cam_pothole if is_ph else cam_bump):
-                    # Distance says anomaly, but camera doesn't confirm it
-                    if abs(dev) < 5.0: # small deviation, likely noise
+                    if is_ph:
+                        if us_dev >= 2.0: us_agrees = True
+                        else: us_contradicts = True
+                    elif is_bump:
+                        if us_dev <= -2.0: us_agrees = True
+                        else: us_contradicts = True
+                
+                # 1. If Ultrasonic is running and contradicts LiDAR, veto.
+                if us_contradicts:
+                    verified = False
+                    
+                # 2. If Ultrasonic agrees, DO NOT let the camera veto a small LiDAR deviation
+                elif camera and not (cam_pothole if is_ph else cam_bump):
+                    if not us_agrees and abs(dev) < 5.0:
+                        # Veto if it's a small deviation and there's no backup from US or Camera
                         verified = False
                         
                 if verified:
@@ -609,7 +619,8 @@ def run_detection(model):
                     )
                 else:
                     status_ph.info(
-                        f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm**"
+                        f"🔶 Speed Bump — dist: **{dist} cm** | dev: **{dev_s} cm** | "
+                        f"streak [{sb}] {st.session_state.confirm_streak}/{confirm_n}"
                     )
 
             # ── UI UPDATE (throttled to 10 Hz) ────────────────────────────────────
