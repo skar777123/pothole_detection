@@ -15,6 +15,7 @@ class CameraDriver:
         # when it inevitably tries to pass them in. 
         self.stream_url = stream_url
         self.latest_label = "Normal road"
+        self.current_frame = None
         self.running = True
         self.cap = None
 
@@ -37,6 +38,8 @@ class CameraDriver:
                 ret, frame = self.cap.read()
                 if ret:
                     frame_counter += 1
+                    # Save a copy so the UI can render it natively
+                    self.current_frame = frame
                     
                     # === RUN AI DETECTION EVERY 10 FRAMES TO SAVE CPU ===
                     if frame_counter % 10 == 0:
@@ -69,6 +72,10 @@ class CameraDriver:
     def get_latest_label(self):
         """ Instantly returns the latest classification from the AI """
         return self.latest_label
+
+    def get_latest_frame(self):
+        """ Returns the most recent OpenCV frame to render on the dashboard """
+        return self.current_frame
 
     def close(self):
         self.running = False

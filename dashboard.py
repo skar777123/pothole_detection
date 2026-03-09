@@ -21,6 +21,7 @@ import numpy as np
 import time
 import joblib
 import logging
+import cv2
 from collections import deque
 
 from lidar_driver import (
@@ -332,17 +333,8 @@ def run_detection(model):
     
     col_cam, col_status = st.columns([1, 2])
     with col_cam:
-        if esp32_cam_url:
-            st.markdown(
-                f'<a href="{esp32_cam_url}" target="_blank" title="Click to test Stream URL in new tab">'
-                f'<img src="{esp32_cam_url}" '
-                f'onerror="this.onerror=null; this.src=\'https://fakeimg.pl/640x360/282c34/ff0000/?text=Camera+Unreachable%0ACheck+IP+Address\';" '
-                f'width="100%" style="border-radius:10px; border:2px solid gray; margin-bottom: 10px;">'
-                f'</a>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info("ℹ️ No camera stream URL")
+        st.markdown("**ESP32-CAM AI Feed**")
+        cam_video_ph = st.empty()
         cam_text_ph = st.empty()
         
     with col_status:
@@ -643,6 +635,12 @@ def run_detection(model):
                               delta=f"{dev:+.1f}", delta_color="inverse")
                 if camera: 
                     cam_text_ph.markdown(f"**📸 Camera AI:** `{cam_label}`")
+                    frame = camera.get_latest_frame()
+                    if frame is not None:
+                        # OpenCV uses BGR, Streamlit uses RGB
+                        cam_video_ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_column_width=True)
+                    else:
+                        cam_video_ph.info("⏳ Waiting for video stream...")
                 ph_str.metric("📶 Strength",     strength)
                 ph_temp.metric("🌡️ Temp",        f"{temp}°C")
                 ph_cnt.metric("🕳️ Potholes",    st.session_state.pothole_count)
