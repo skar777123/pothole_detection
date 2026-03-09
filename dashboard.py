@@ -109,8 +109,10 @@ with st.sidebar:
     st.title("⚙️ Settings")
 
     available_ports = list_ports()
-    lidar_port = st.text_input("LiDAR Port", value="/dev/ttyUSB0",
+    lidar_port = st.text_input("LiDAR Port", value="COM3" if "COM" in str(available_ports) else "/dev/ttyUSB0",
                                help="Linux: /dev/ttyUSB0  |  Windows: COM3")
+    camera_port = st.text_input("Camera Serial Port", value="COM4" if "COM" in str(available_ports) else "/dev/serial0",
+                               help="The port the ESP32-CAM is connected to for serial labels.")
     esp32_cam_url = st.text_input("ESP32-CAM Stream URL", value="http://192.168.1.100:81/stream",
                                help="Paste the IP Stream URL to view the live camera feed.")
     if available_ports:
@@ -302,10 +304,10 @@ def run_detection(model):
         
     camera = None
     try:
-        camera = CameraDriver(port='/dev/serial0', baudrate=115200)
+        camera = CameraDriver(port=camera_port, baudrate=115200)
         st.success("📸 Camera Driver initialized.")
     except Exception as exc:
-        st.warning(f"⚠️ Camera Driver initialization failed: {exc}.")
+        st.warning(f"⚠️ Camera Driver initialization failed: {exc}. Running without camera label verification.")
 
     # ── UI layout ─────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
@@ -647,11 +649,12 @@ def run_detection(model):
                 )
 
                 if st.session_state.pothole_log:
-                    log_ph.subheader("📋 Detection Log")
-                    log_ph.dataframe(
-                        pd.DataFrame(st.session_state.pothole_log).head(50),
-                        width="stretch",
-                    )
+                    with log_ph.container():
+                        st.subheader("📋 Detection Log")
+                        st.dataframe(
+                            pd.DataFrame(st.session_state.pothole_log).head(50),
+                            width="stretch",
+                        )
 
                 last_ui_t = now
 

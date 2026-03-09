@@ -26,8 +26,8 @@ class CameraDriver:
             )
             logger.info("Camera UART Port opened: %s @ %d baud", self.port, self.baudrate)
         except Exception as e:
-            logger.warning("Failed to open Camera UART, using MOCK values. Error: %s", e)
-            self._ser = None
+            logger.error("Failed to open Camera UART. Error: %s", e)
+            raise e
         
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
