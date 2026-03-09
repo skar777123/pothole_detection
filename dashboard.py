@@ -220,9 +220,14 @@ def rule_classify(dist_buf, baseline, max_plausible):
 def compute_dimensions(dist_buf, str_buf, baseline):
     arr      = np.array(dist_buf, dtype=float)
     dev      = arr - baseline
-    depth_cm = float(max(dev.max(), 0))
-    in_hole  = int(np.sum(dev > pot_thresh))
-    length   = round(in_hole * dist_per_reading, 1)
+    
+    # Compute max absolute deviation (depth of pothole OR height of bump)
+    depth_cm = float(max(abs(dev.min()), dev.max()))
+    
+    # Count frames in anomaly (both positive and negative)
+    in_anomaly  = int(np.sum((dev > pot_thresh) | (dev < -bump_thresh)))
+    length   = round(in_anomaly * dist_per_reading, 1)
+    
     return {
         "depth_cm"    : round(depth_cm, 1),
         "length_cm"   : length,
@@ -562,16 +567,19 @@ def run_detection(model):
                         f"(cooldown ⏳ {remaining:.1f}s) — "
                         f"dev: **{dev:+.1f} cm**"
                     )
-                    st.session_state.confirm_streak = 0
+                    # Don't reset streak here, otherwise a constant anomaly will NEVER log
                 else:
                     # === FIRE ALERT (bypasses UI throttle) ===
                     dims = compute_dimensions(dist_buf, str_buf, baseline)
-                    if is_ph:   st.session_state.pothole_count += 1
-                    elif is_bump: st.session_state.bump_count  += 1
+                    if is_ph:   
+                        st.session_state.pothole_count += 1
+                        st.session_state.last_depth = dims["depth_cm"]
+                    elif is_bump: 
+                        st.session_state.bump_count  += 1
+                        st.session_state.last_depth = dims["depth_cm"]
 
                     st.session_state.confirm_streak  = 0
                     st.session_state.last_detect_t   = now_t
-                    st.session_state.last_depth      = dims["depth_cm"]
 
                     half = len(dist_buf) // 2
                     dist_buf[:] = dist_buf[half:]
