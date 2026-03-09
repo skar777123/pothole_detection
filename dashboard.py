@@ -77,6 +77,7 @@ BASELINE_WINDOW = 20   # number of readings used to compute rolling baseline
 
 _defaults = {
     "dist_history"      : deque(maxlen=500),
+    "us_history"        : deque(maxlen=500),
     "dev_history"       : deque(maxlen=500),
     "str_history"       : deque(maxlen=500),
     "baseline_hist"     : deque(maxlen=500),
@@ -136,12 +137,12 @@ with st.sidebar:
     # TF02-Pro noise at 10 m ≈ ±4 cm → thresholds default just above noise floor
     _NOISE_AT_10M = 4.0
     pot_thresh  = st.number_input("Shallow threshold (cm)", 1.0, 30.0,
-                                  value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
+                                  value=1.0, step=0.5,
                                   help="Positive deviation to trigger shallow pothole.")
     deep_thresh = st.number_input("Deep threshold (cm)", 1.0, 50.0,
                                   value=float(DEEP_THRESH_CM), step=0.5)
     bump_thresh = st.number_input("Bump threshold (cm)", 1.0, 30.0,
-                                  value=round(_NOISE_AT_10M + 0.5, 1), step=0.5,
+                                  value=1.0, step=0.5,
                                   help="Negative deviation to trigger speed bump.")
     max_plausible = st.number_input("Max Plausible Deviation (cm)", 10.0, 150.0,
                                   value=60.0, step=1.0,
@@ -321,7 +322,20 @@ def run_detection(model):
     ph_cnt   = kc[7].empty(); ph_bump = kc[8].empty(); ph_dep = kc[9].empty()
 
     st.markdown("---")
-    status_ph = st.empty()
+    
+    col_cam, col_status = st.columns([1, 2])
+    with col_cam:
+        if esp32_cam_url:
+            st.markdown(
+                f'<img src="{esp32_cam_url}" width="100%" style="border-radius:10px; border:2px solid gray; margin-bottom: 10px;">',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("ℹ️ No camera stream URL")
+        cam_text_ph = st.empty()
+        
+    with col_status:
+        status_ph = st.empty()
 
     st.markdown("### 📡 Live Stream")
     ca, cb = st.columns(2)
@@ -449,6 +463,7 @@ def run_detection(model):
             st.session_state.dev_history.append(dev)
             st.session_state.str_history.append(strength)
             st.session_state.baseline_hist.append(baseline)
+            st.session_state.us_history.append(st.session_state.us_dist)
 
             # Sliding window
             dist_buf.append(dist)
@@ -603,7 +618,8 @@ def run_detection(model):
                 ph_us.metric("🔊 US Dist",      f"{st.session_state.us_dist} cm")
                 ph_dev.metric("↕️ Deviation",   f"{dev:+.1f} cm",
                               delta=f"{dev:+.1f}", delta_color="inverse")
-                if camera: ph_cam.metric("📸 Cam", cam_label.split()[0] if cam_label else "N/A")
+                if camera: 
+                    cam_text_ph.markdown(f"**📸 Camera AI:** `{cam_label}`")
                 ph_str.metric("📶 Strength",     strength)
                 ph_temp.metric("🌡️ Temp",        f"{temp}°C")
                 ph_cnt.metric("🕳️ Potholes",    st.session_state.pothole_count)
@@ -613,6 +629,7 @@ def run_detection(model):
                 chart_dist.line_chart(pd.DataFrame({
                     "Distance (cm)": list(st.session_state.dist_history),
                     "Baseline (cm)": list(st.session_state.baseline_hist),
+                    "Ultrasonic (cm)": list(st.session_state.us_history),
                 }))
                 chart_dev.line_chart(pd.DataFrame({
                     "Deviation (cm)": list(st.session_state.dev_history),
