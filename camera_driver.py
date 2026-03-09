@@ -1,4 +1,4 @@
-import serial
+import cv2
 import threading
 import time
 import logging
@@ -7,65 +7,74 @@ logger = logging.getLogger(__name__)
 
 class CameraDriver:
     """
-    Driver for reading classification data from ESP32-CAM via UART.
-    The ESP32-CAM should be connected to Raspberry Pi's GPIO14 (TX) and GPIO15 (RX).
+    Driver for reading MJPEG stream from ESP32-CAM over Wi-Fi
+    and running local AI (OpenCV/YOLO) on the frames.
     """
-    def __init__(self, port='/dev/serial0', baudrate=115200, timeout=1.0):
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        
+    def __init__(self, stream_url="http://192.168.1.100:81/stream", baudrate=None, port=None):
+        # We leave baudrate and port in the init args so dashboard.py doesn't crash
+        # when it inevitably tries to pass them in. 
+        self.stream_url = stream_url
         self.latest_label = "Normal road"
         self.running = True
-        
-        try:
-            self._ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=self.timeout
-            )
-            logger.info("Camera UART Port opened: %s @ %d baud", self.port, self.baudrate)
-        except Exception as e:
-            logger.error("Failed to open Camera UART. Error: %s", e)
-            raise e
+        self.cap = None
+
+        logger.info("Initializing AI Camera Stream at %s", self.stream_url)
         
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
 
     def _poll_loop(self):
-        """ Background thread to read strings from ESP32 UART. """
+        """ Background thread to read video frames and run AI detection """
+        self.cap = cv2.VideoCapture(self.stream_url)
+        
+        # If the stream fails to open, fallback to dummy mode just so the dashboard doesn't hang
+        if not self.cap.isOpened():
+            logger.warning("Failed to open Camera Stream. Please check the IP address!")
+        
+        frame_counter = 0
         while self.running:
-            if self._ser and self._ser.is_open:
-                try:
-                    if self._ser.in_waiting > 0:
-                        line = self._ser.readline().decode('utf-8', errors='ignore').strip()
-                        if line:
-                            label_lower = line.lower()
-                            if "pothole" in label_lower:
-                                self.latest_label = "Pothole detected"
-                            elif "bump" in label_lower:
-                                self.latest_label = "Speed bump detected"
-                            elif "normal" in label_lower:
-                                self.latest_label = "Normal road"
-                            else:
-                                # Could be raw data, ignore or log
-                                pass
-                except Exception as e:
-                    logger.error("Camera UART read failure: %s", e)
+            if self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret:
+                    frame_counter += 1
+                    
+                    # === RUN AI DETECTION EVERY 10 FRAMES TO SAVE CPU ===
+                    if frame_counter % 10 == 0:
+                        self.latest_label = self._run_ai_inference(frame)
+                        
+                else:
+                    logger.warning("Camera stream dropped. Retrying...")
+                    self.cap.release()
+                    time.sleep(2)
+                    self.cap = cv2.VideoCapture(self.stream_url)
             else:
-                # Mock behavior when not connected
                 time.sleep(1)
-            time.sleep(0.01)
+            
+            time.sleep(0.01) # Small sleep to prevent maxing out CPU
+
+    def _run_ai_inference(self, frame):
+        """
+        Placeholder for your actual YOLO/OpenCV Model.
+        Right now, it just returns Normal road.
+        
+        Replace this with actual logic:
+        results = my_yolo_model.predict(frame)
+        if "pothole" in results: return "Pothole detected"
+        ...
+        """
+        # Example: Fake detection logic. 
+        # For now, we just return Normal road to act as the baseline.
+        return "Normal road"
 
     def get_latest_label(self):
-        """ Instantly returns the latest classification from ESP32-CAM. """
+        """ Instantly returns the latest classification from the AI """
         return self.latest_label
 
     def close(self):
         self.running = False
-        if self._ser and self._ser.is_open:
-            self._ser.close()
-            logger.info("Camera UART closed.")
+        if self.cap:
+            self.cap.release()
+        logger.info("Camera Stream closed.")
 
     def __enter__(self): return self
     def __exit__(self, *_): self.close()

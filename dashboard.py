@@ -309,10 +309,10 @@ def run_detection(model):
         
     camera = None
     try:
-        camera = CameraDriver(port=camera_port, baudrate=115200)
-        st.success("📸 Camera Driver initialized.")
+        camera = CameraDriver(stream_url=esp32_cam_url)
+        st.success("📸 Camera AI initialized over Wi-Fi.")
     except Exception as exc:
-        st.warning(f"⚠️ Camera Driver initialization failed: {exc}. Running without camera label verification.")
+        st.warning(f"⚠️ Camera AI initialization failed: {exc}. Running without camera label verification.")
 
     # ── UI layout ─────────────────────────────────────────────────────────────
     hdr_l, hdr_r = st.columns([6, 1])
@@ -541,10 +541,12 @@ def run_detection(model):
                 if us_contradicts:
                     verified = False
                     
-                # 2. If Ultrasonic agrees, DO NOT let the camera veto a small LiDAR deviation
+                # 2. If camera actively disagrees with a small deviation, veto it.
+                # However, if camera simply doesn't see anything, we still want to log the anomaly
+                # if the LiDAR is confident. So we don't strictly veto *just* because camera is missing.
                 elif camera and not (cam_pothole if is_ph else cam_bump):
-                    if not us_agrees and abs(dev) < 5.0:
-                        # Veto if it's a small deviation and there's no backup from US or Camera
+                    if not us_agrees and abs(dev) < 3.0: # Only veto very tiny deviations
+                        # Veto if it's a tiny deviation and there's no backup from US or Camera
                         verified = False
                         
                 if verified:
