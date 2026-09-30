@@ -9,6 +9,7 @@ and hardware diagnostics for the React frontend.
 import asyncio
 import json
 import logging
+import random
 import threading
 import time
 from pathlib import Path
@@ -609,7 +610,8 @@ def health():
 @app.get("/api/ports")
 def get_available_ports():
     ports = list_ports()
-    return {"ports": ports}
+    all_ports = ["auto"] + [p for p in ports if p != "auto"]
+    return {"ports": all_ports}
 
 @app.get("/api/status")
 def get_status():
