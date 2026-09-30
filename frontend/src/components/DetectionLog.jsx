@@ -7,18 +7,23 @@ export default function DetectionLog({ logs, onClearLog }) {
 
   const filteredLogs = useMemo(() => {
     return (logs || []).filter((item) => {
+      if (!item) return false;
+      const itemType = String(item.type || "").toLowerCase();
+      const itemTime = String(item.time || "").toLowerCase();
+      const itemSev = String(item.severity || "").toLowerCase();
+
       const matchesType =
         filterType === "ALL" ||
-        (filterType === "POTHOLE" && item.type.toLowerCase().includes("pothole")) ||
-        (filterType === "DEEP" && item.type.toLowerCase().includes("deep")) ||
-        (filterType === "BUMP" && item.type.toLowerCase().includes("bump"));
+        (filterType === "POTHOLE" && itemType.includes("pothole")) ||
+        (filterType === "DEEP" && itemType.includes("deep")) ||
+        (filterType === "BUMP" && itemType.includes("bump"));
 
       const query = searchQuery.trim().toLowerCase();
       const matchesQuery =
         !query ||
-        item.time.toLowerCase().includes(query) ||
-        item.type.toLowerCase().includes(query) ||
-        item.severity.toLowerCase().includes(query);
+        itemTime.includes(query) ||
+        itemType.includes(query) ||
+        itemSev.includes(query);
 
       return matchesType && matchesQuery;
     });
@@ -149,10 +154,10 @@ export default function DetectionLog({ logs, onClearLog }) {
             </thead>
             <tbody className="divide-y divide-zinc-100 font-mono">
               {filteredLogs.map((row, index) => {
-                const isDeep =
-                  row.type.toLowerCase().includes("deep") ||
-                  row.severity.toLowerCase().includes("deep");
-                const isPothole = row.type.toLowerCase().includes("pothole");
+                const rType = String(row?.type || "").toLowerCase();
+                const rSev = String(row?.severity || "").toLowerCase();
+                const isDeep = rType.includes("deep") || rSev.includes("deep");
+                const isPothole = rType.includes("pothole");
 
                 let badgeClass = "bg-zinc-100 text-zinc-800 border-zinc-200";
                 if (isDeep) {
