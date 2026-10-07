@@ -22,7 +22,7 @@ error() { echo -e "${R}${B}[ERROR]${X} $*"; exit 1; }
 head()  { echo -e "\n${C}${B}=== $* ===${X}"; }
 
 # Banner
-clear
+if [ -t 1 ]; then clear 2>/dev/null || true; fi
 echo -e "${C}${B}"
 echo "  +--------------------------------------------+"
 echo "  |   TF02-Pro LiDAR Pothole Detection System  |"

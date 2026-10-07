@@ -129,11 +129,14 @@ export default function ConnectionPanel({
               {availablePorts.length > 0 ? (
                 availablePorts.map((p) => (
                   <option key={p} value={p}>
-                    {p}
+                    {p === "auto" ? "⚡ Auto-Detect (Scan Ports)" : p}
                   </option>
                 ))
               ) : (
-                <option value={selectedPort}>{selectedPort} (Manual)</option>
+                <>
+                  <option value="auto">⚡ Auto-Detect (Scan Ports)</option>
+                  <option value={selectedPort}>{selectedPort} (Manual)</option>
+                </>
               )}
             </select>
 

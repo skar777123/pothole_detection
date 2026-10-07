@@ -1,14 +1,38 @@
-import React, { useRef, useEffect, useState, useCallback } from "react";
-import { Play, Pause, Plus, Bike, AlertTriangle, CheckCircle2, Lock, RefreshCw, Sliders, Keyboard, X } from "lucide-react";
+import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import {
+  Play,
+  Pause,
+  Plus,
+  AlertTriangle,
+  CheckCircle2,
+  RefreshCw,
+  Keyboard,
+  X,
+  Compass,
+  Radio,
+  ArrowUpDown,
+  Zap,
+  Clock,
+  Gauge,
+  ListFilter,
+  Search,
+  Download,
+  Trash2,
+  Ruler,
+} from "lucide-react";
 
 /**
  * RoadSimulation2D
  * ================
- * Dedicated 2D simulation with Hill Climb physics for a modern motorbike
- * facing from left to right (driving forward toward the right).
- * Features a front-mounted TF02-Pro LiDAR positioned above the headlights
- * with adjustable angle (default 43.20 deg) and a fiery red-amber mixed laser beam.
- * Pure procedural vector line-art blueprint styling and hardware-sync protection.
+ * High-precision 2D road & vehicle simulation for LiDAR Pothole Detection.
+ * 
+ * Features:
+ * - Fixed 5.0-meter (500 cm / 16.4 ft) LiDAR slant ray geometry.
+ * - Prominent display of the sensor's baseline / base value (auto-calibrated or nominal).
+ * - Full live Event Records & Anomaly Log table directly inside the simulation tab (synced with Dashboard).
+ * - Clean, accurate Economic Commuter Motorcycle blueprint (100-125cc commuter architecture with perfectly aligned wheels, swingarm, dual shocks, engine, chaincase, fuel tank, long seat, forks, and TF02-Pro sensor).
+ * - Multi-unit telemetry HUD (cm, m, ft, in, km/h, m/s, mph, ms).
+ * - Right-to-left data registration (oncoming road ahead -> front wheel -> chassis -> rear wheel).
  */
 export default function RoadSimulation2D({
   telemetry,
@@ -19,6 +43,11 @@ export default function RoadSimulation2D({
   onResetSimulation,
   onSimulatedAnomaly,
   onSpeedChange,
+  logs = [],
+  onClearLog,
+  potholeCount = 0,
+  bumpCount = 0,
+  lastDepth = 0,
 }) {
   const canvasRef = useRef(null);
 
@@ -32,26 +61,9 @@ export default function RoadSimulation2D({
   const [autoSpawn, setAutoSpawn] = useState(false);
   const [showShortcutsModal, setShowShortcutsModal] = useState(false);
 
-  // Adjustable sensor mounting angle (degrees from horizontal pointing forward-downward, min 25 deg, max 50 deg)
-  const [sensorAngleDeg, setSensorAngleDeg] = useState(() => {
-    try {
-      const saved = localStorage.getItem("pothole_sensor_angle");
-      const parsed = parseFloat(saved);
-      return !isNaN(parsed) && parsed >= 25.0 && parsed <= 50.0 ? parsed : 43.20;
-    } catch {
-      return 43.20;
-    }
-  });
-
-  const handleAngleChange = useCallback((newAngle) => {
-    const clamped = Math.max(25.0, Math.min(50.0, Math.round(newAngle * 10) / 10));
-    setSensorAngleDeg(clamped);
-    try {
-      localStorage.setItem("pothole_sensor_angle", clamped.toString());
-    } catch {
-      // ignore storage error
-    }
-  }, []);
+  // Filter state for the event records table
+  const [eventFilter, setEventFilter] = useState("ALL");
+  const [eventSearch, setEventSearch] = useState("");
 
   // Road surface presets: "asphalt" | "mud" | "dirt" | "cobble"
   const ROAD_PRESETS = [
@@ -74,9 +86,7 @@ export default function RoadSimulation2D({
     setRoadPreset(preset);
     try {
       localStorage.setItem("pothole_road_preset", preset);
-    } catch {
-      // ignore storage error
-    }
+    } catch {}
   }, []);
 
   const cycleRoadPreset = useCallback(() => {
@@ -86,9 +96,7 @@ export default function RoadSimulation2D({
       const nextPreset = list[nextIdx];
       try {
         localStorage.setItem("pothole_road_preset", nextPreset);
-      } catch {
-        // ignore storage error
-      }
+      } catch {}
       return nextPreset;
     });
   }, []);
@@ -102,21 +110,90 @@ export default function RoadSimulation2D({
     }
   }, [isHardwareAvailable]);
 
-  // Live HUD telemetry
+  // Sensor Base Value calculation (auto-calibrated baseline or 500 cm nominal slant)
+  const baseValueCm = useMemo(() => {
+    if (isHardwareAvailable && telemetry && typeof telemetry.baseline_cm === "number" && telemetry.baseline_cm > 0) {
+      return telemetry.baseline_cm;
+    }
+    return 500.0; // Nominal 5.0m fixed beam baseline
+  }, [isHardwareAvailable, telemetry]);
+
+  const isCalibrated = Boolean(telemetry?.calibrated);
+  const warmupCount = telemetry?.warmup_count || 0;
+  const warmupTotal = telemetry?.warmup_total || 20;
+
+  // Live Comprehensive HUD telemetry metrics (multi-unit)
   const [hudStats, setHudStats] = useState({
     speedKmph: 30,
-    slantDistanceCm: 146.1,
-    verticalDepthCm: 100.0,
+    speedMps: 8.33,
+    speedMph: 18.64,
+    slantDistanceCm: 500.0,
+    slantDistanceM: 5.0,
+    slantDistanceFt: 16.4,
+    baseValueCm: 500.0,
+    baseValueM: 5.0,
+    baseValueFt: 16.4,
+    verticalDepthCm: 85.0,
+    verticalDepthM: 0.85,
+    verticalDepthIn: 33.46,
     deviationCm: 0.0,
-    surfaceType: "Nominal Pavement",
+    deviationMm: 0.0,
+    deviationIn: 0.0,
+    earlyWarningLeadCm: 492.7,
+    earlyWarningLeadM: 4.93,
+    earlyWarningLeadFt: 16.16,
+    timeToImpactMs: 592,
+    surfaceType: "Nominal Asphalt",
     isAlert: false,
     severity: "None",
     detectedCount: 0,
-    earlyWarningLeadCm: 70.0,
+    activeHazard: null,
   });
 
-  // Recent detections log for this simulation run
+  // Local session detections fallback buffer
   const [sessionDetections, setSessionDetections] = useState([]);
+
+  // Combined event records list (merging logs prop and local session detections)
+  const combinedEventRecords = useMemo(() => {
+    const map = new Map();
+    // Prioritize passed logs from App / Backend
+    (logs || []).forEach((item) => {
+      if (item && item.id) map.set(item.id, item);
+    });
+    // Add local session detections if not present
+    sessionDetections.forEach((item) => {
+      if (item && item.id && !map.has(item.id)) map.set(item.id, item);
+    });
+    const combined = Array.from(map.values());
+    // Sort descending by id/timestamp
+    return combined.sort((a, b) => (b.id || 0) - (a.id || 0));
+  }, [logs, sessionDetections]);
+
+  // Filtered event records
+  const filteredEventRecords = useMemo(() => {
+    return combinedEventRecords.filter((item) => {
+      if (!item) return false;
+      const t = String(item.type || "").toLowerCase();
+      const timeStr = String(item.time || "").toLowerCase();
+      const sev = String(item.severity || "").toLowerCase();
+
+      const matchesFilter =
+        eventFilter === "ALL" ||
+        (eventFilter === "POTHOLE" && t.includes("pothole")) ||
+        (eventFilter === "DEEP" && t.includes("deep")) ||
+        (eventFilter === "BUMP" && t.includes("bump"));
+
+      const q = eventSearch.trim().toLowerCase();
+      const matchesSearch =
+        !q ||
+        t.includes(q) ||
+        timeStr.includes(q) ||
+        sev.includes(q) ||
+        String(item.depth_cm || "").includes(q);
+
+      return matchesFilter && matchesSearch;
+    });
+  }, [combinedEventRecords, eventFilter, eventSearch]);
 
   // Animation and physics state refs
   const animFrameRef = useRef(null);
@@ -124,11 +201,15 @@ export default function RoadSimulation2D({
   const distanceTraveledRef = useRef(0);
   const detectedCountRef = useRef(0);
 
-  // Road terrain anomalies queue
-  const anomaliesRef = useRef([]);
+  // Road terrain anomalies queue (worldX coordinates)
+  const anomaliesRef = useRef([
+    { id: 1, worldX: 950, type: "pothole", depthCm: 6.2, widthCm: 45, detected: false },
+    { id: 2, worldX: 1800, type: "deep_pothole", depthCm: 12.0, widthCm: 65, detected: false },
+    { id: 3, worldX: 2700, type: "bump", depthCm: -5.8, widthCm: 50, detected: false },
+  ]);
 
   // Rolling terrain elevation buffer for hardware mode
-  // Stores objects: { worldX, devCm }
+  // Stores objects: { worldX, devCm } registered from RIGHT (laser hit point) to LEFT (wheels)
   const hardwareTerrainBufferRef = useRef([]);
 
   // Vehicle suspension dynamics
@@ -144,41 +225,40 @@ export default function RoadSimulation2D({
     }
   }, [settings?.speed_kmph]);
 
-  // Push incoming live telemetry into hardware terrain buffer
+  // Push incoming live hardware telemetry into terrain buffer
   useEffect(() => {
     if (simMode === "hardware" && isHardwareAvailable && telemetry) {
-      const dev = telemetry.deviation_cm || 0;
+      const dev = typeof telemetry.deviation_cm === "number" ? telemetry.deviation_cm : 0;
       const canvas = canvasRef.current;
       const width = canvas ? canvas.width / (window.devicePixelRatio || 1) : 1000;
-      
-      // Compute exactly where the laser hits the ground relative to the bike
-      const bikeScreenX = width * 0.22;
-      const lidarOriginX = bikeScreenX + 30;
-      const nominalVerticalDepthCm = 65.0;
-      const beamAngleRad = (sensorAngleDeg * Math.PI) / 180;
-      const pixelsPerCm = 120 / 100;
-      const rayT = nominalVerticalDepthCm / Math.sin(beamAngleRad);
-      const hitScreenX = lidarOriginX + rayT * Math.cos(beamAngleRad) * pixelsPerCm;
-      
+
+      // Fixed 5-meter slant ray geometry
+      const bikeScreenX = Math.max(90, width * 0.15);
+      const lidarOriginX = bikeScreenX + 44;
+      const nominalLeadDistanceCm = 492.7; // 500cm hypotenuse with ~85cm height
+      const pixelsPerCm = 1.2; // 120 px = 1 meter
+      const hitScreenX = lidarOriginX + nominalLeadDistanceCm * pixelsPerCm;
+
       const spawnWorldX = distanceTraveledRef.current + hitScreenX;
-      
+
       hardwareTerrainBufferRef.current.push({
         worldX: spawnWorldX,
-        devCm: dev
+        devCm: dev,
       });
 
-      // Keep buffer clean for performance (keep last 300 points)
-      if (hardwareTerrainBufferRef.current.length > 300) {
+      // Keep buffer clean (last 400 points)
+      if (hardwareTerrainBufferRef.current.length > 400) {
         hardwareTerrainBufferRef.current.shift();
       }
     }
-  }, [simMode, isHardwareAvailable, telemetry, sensorAngleDeg]);
+  }, [simMode, isHardwareAvailable, telemetry]);
 
   // Manual anomaly spawner
   const spawnAnomaly = useCallback((type) => {
     const canvas = canvasRef.current;
     const viewWidth = canvas ? canvas.width / (window.devicePixelRatio || 1) : 1000;
-    const worldX = distanceTraveledRef.current + viewWidth + 120;
+    // Spawn ahead on the right side of the road
+    const worldX = distanceTraveledRef.current + viewWidth + 150;
 
     let depthCm = 5.0;
     let widthCm = 45;
@@ -209,10 +289,11 @@ export default function RoadSimulation2D({
     distanceTraveledRef.current = 0;
     detectedCountRef.current = 0;
     setSessionDetections([]);
+    hardwareTerrainBufferRef.current = [];
     anomaliesRef.current = [
-      { id: 1, worldX: 750, type: "pothole", depthCm: 6.2, widthCm: 45, detected: false },
-      { id: 2, worldX: 1400, type: "deep_pothole", depthCm: 12.0, widthCm: 65, detected: false },
-      { id: 3, worldX: 2100, type: "bump", depthCm: -5.8, widthCm: 50, detected: false },
+      { id: 1, worldX: 950, type: "pothole", depthCm: 6.2, widthCm: 45, detected: false },
+      { id: 2, worldX: 1800, type: "deep_pothole", depthCm: 12.0, widthCm: 65, detected: false },
+      { id: 3, worldX: 2700, type: "bump", depthCm: -5.8, widthCm: 50, detected: false },
     ];
     const nominalSurface =
       roadPreset === "mud"
@@ -222,13 +303,17 @@ export default function RoadSimulation2D({
         : roadPreset === "cobble"
         ? "Nominal Cobblestone"
         : "Nominal Asphalt";
+
     setHudStats((prev) => ({
       ...prev,
       detectedCount: 0,
       deviationCm: 0.0,
+      deviationMm: 0.0,
+      deviationIn: 0.0,
       surfaceType: nominalSurface,
       isAlert: false,
       severity: "None",
+      activeHazard: null,
     }));
   }, [roadPreset]);
 
@@ -239,36 +324,64 @@ export default function RoadSimulation2D({
     }
   }, [resetTrigger, handleReset]);
 
-  // Global Keyboard Shortcuts listener for 2D Simulation
+  // Export event records to CSV
+  const exportCsv = () => {
+    if (!combinedEventRecords || combinedEventRecords.length === 0) return;
+    const headers = [
+      "Time",
+      "Type",
+      "Deviation (cm)",
+      "Depth (cm)",
+      "Length (cm)",
+      "Width (cm)",
+      "Slant Range (cm)",
+      "Lookahead Lead (m)",
+      "Severity",
+      "Confidence",
+      "Signal Strength",
+      "Baseline (cm)",
+    ];
+    const rows = combinedEventRecords.map((item) => [
+      item.time || "",
+      item.type || "",
+      item.deviation_cm || "",
+      item.depth_cm || 0,
+      item.length_cm || 0,
+      item.width_cm || 0,
+      item.slant_range_cm || item.slant_range || "",
+      item.lead_dist_m || "",
+      item.severity || "",
+      item.confidence || "",
+      item.strength || 0,
+      item.baseline || baseValueCm,
+    ]);
+
+    const csvContent =
+      "data:text/csv;charset=utf-8," +
+      [headers.join(","), ...rows.map((e) => e.join(","))].join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `road_simulation_events_${Date.now()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Global Keyboard Shortcuts listener
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // Ignore keystrokes when typing inside input fields
       const tag = e.target.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || e.target.isContentEditable) {
         return;
       }
 
-      // Close modal on Escape
-      if (e.key === "Escape") {
-        setShowShortcutsModal(false);
-        return;
-      }
-
-      // Open/close shortcuts cheat sheet with '?' or '/'
-      if (e.key === "?" || (e.key === "/" && !e.ctrlKey && !e.metaKey)) {
-        e.preventDefault();
-        setShowShortcutsModal((prev) => !prev);
-        return;
-      }
-
-      // Space to toggle Play / Pause
       if (e.code === "Space") {
         e.preventDefault();
         setIsRunning((prev) => !prev);
         return;
       }
 
-      // 'R' or 'r' to trigger complete reset
       if (e.key === "r" || e.key === "R") {
         if (!e.ctrlKey && !e.metaKey) {
           e.preventDefault();
@@ -278,81 +391,49 @@ export default function RoadSimulation2D({
         }
       }
 
-      // '1', '2', '3' to trigger anomaly spawns
-      if (simMode === "generator") {
-        if (e.key === "1") {
-          e.preventDefault();
-          spawnAnomaly("deep_pothole");
-          return;
-        }
-        if (e.key === "2") {
-          e.preventDefault();
-          spawnAnomaly("pothole");
-          return;
-        }
-        if (e.key === "3") {
-          e.preventDefault();
-          spawnAnomaly("bump");
-          return;
-        }
+      if (e.key === "1") {
+        e.preventDefault();
+        spawnAnomaly("pothole");
+        return;
+      }
+      if (e.key === "2") {
+        e.preventDefault();
+        spawnAnomaly("deep_pothole");
+        return;
+      }
+      if (e.key === "3") {
+        e.preventDefault();
+        spawnAnomaly("bump");
+        return;
       }
 
-      // 'W' or 'w' to speed up (also ArrowUp)
-      if (e.key === "w" || e.key === "W" || e.code === "ArrowUp") {
-        if (!e.ctrlKey && !e.metaKey) {
-          e.preventDefault();
-          setSimSpeedKmph((prev) => {
-            const nextSpeed = Math.min(80, prev + 5);
-            if (onSpeedChange) onSpeedChange(nextSpeed);
-            return nextSpeed;
-          });
-          return;
-        }
+      if (e.key === "w" || e.key === "W" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setSimSpeedKmph((curr) => {
+          const next = Math.min(100, curr + 5);
+          if (onSpeedChange) onSpeedChange(next);
+          return next;
+        });
+        return;
+      }
+      if (e.key === "s" || e.key === "S" || e.key === "ArrowDown") {
+        e.preventDefault();
+        setSimSpeedKmph((curr) => {
+          const next = Math.max(5, curr - 5);
+          if (onSpeedChange) onSpeedChange(next);
+          return next;
+        });
+        return;
       }
 
-      // 'S' or 's' to speed down (also ArrowDown)
-      if (e.key === "s" || e.key === "S" || e.code === "ArrowDown") {
-        if (!e.ctrlKey && !e.metaKey) {
-          e.preventDefault();
-          setSimSpeedKmph((prev) => {
-            const nextSpeed = Math.max(10, prev - 5);
-            if (onSpeedChange) onSpeedChange(nextSpeed);
-            return nextSpeed;
-          });
-          return;
-        }
-      }
-
-      // 'A' or 'a' for angle moveUp (+0.5 deg) (also ']')
-      if (e.key === "a" || e.key === "A" || e.key === "]" || e.key === "}") {
-        if (!e.ctrlKey && !e.metaKey) {
-          e.preventDefault();
-          handleAngleChange(sensorAngleDeg + 0.5);
-          return;
-        }
-      }
-
-      // 'D' or 'd' for angle down (-0.5 deg) (also '[')
-      if (e.key === "d" || e.key === "D" || e.key === "[" || e.key === "{") {
-        if (!e.ctrlKey && !e.metaKey) {
-          e.preventDefault();
-          handleAngleChange(sensorAngleDeg - 0.5);
-          return;
-        }
-      }
-
-      // 'H' or 'h' to toggle random road hazards auto spawn
       if (e.key === "h" || e.key === "H") {
-        if (!e.ctrlKey && !e.metaKey) {
+        if (simMode === "generator") {
           e.preventDefault();
-          if (simMode === "generator") {
-            setAutoSpawn((prev) => !prev);
-          }
+          setAutoSpawn((prev) => !prev);
           return;
         }
       }
 
-      // 'P' or 'p' to cycle road surface presets
       if (e.key === "p" || e.key === "P") {
         if (!e.ctrlKey && !e.metaKey) {
           e.preventDefault();
@@ -360,11 +441,17 @@ export default function RoadSimulation2D({
           return;
         }
       }
+
+      if (e.key === "?" || (e.shiftKey && e.key === "/")) {
+        e.preventDefault();
+        setShowShortcutsModal((prev) => !prev);
+        return;
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [simMode, handleReset, onResetSimulation, spawnAnomaly, sensorAngleDeg, handleAngleChange, cycleRoadPreset]);
+  }, [simMode, handleReset, onResetSimulation, spawnAnomaly, cycleRoadPreset, onSpeedChange]);
 
   // Main Canvas Rendering Loop
   useEffect(() => {
@@ -376,7 +463,7 @@ export default function RoadSimulation2D({
       const dt = Math.min((now - lastTimeRef.current) / 1000, 0.1);
       lastTimeRef.current = now;
 
-      // Handle high-DPI scaling
+      // High-DPI scaling
       const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
       const width = rect.width;
@@ -390,23 +477,24 @@ export default function RoadSimulation2D({
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      // Physics units and dimensions
+      // Real-world physical unit constants
       const speedMps = (simSpeedKmph * 1000) / 3600;
-      const pixelsPerMeter = 120; // 120 pixels = 1 meter
-      const pixelsPerCm = pixelsPerMeter / 100;
+      const speedMph = simSpeedKmph * 0.621371;
+      const pixelsPerMeter = 120; // 120 pixels on canvas = 1.0 meter
+      const pixelsPerCm = pixelsPerMeter / 100; // 1.2 pixels = 1 cm
 
       if (isRunning) {
         const dx = speedMps * pixelsPerMeter * dt;
         distanceTraveledRef.current += dx;
         vehicleStateRef.current.wheelRot += (dx / 18) % (Math.PI * 2);
 
-        // Procedural road generator: spawn random potholes periodically
+        // Procedural generator: spawn random potholes periodically
         if (simMode === "generator" && autoSpawn) {
-          const spawnIntervalPx = 700;
+          const spawnIntervalPx = 800;
           const lastAnomaly = anomaliesRef.current[anomaliesRef.current.length - 1];
           const nextSpawnThreshold = lastAnomaly
-            ? lastAnomaly.worldX + spawnIntervalPx + Math.random() * 450
-            : distanceTraveledRef.current + width + 200;
+            ? lastAnomaly.worldX + spawnIntervalPx + Math.random() * 500
+            : distanceTraveledRef.current + width + 250;
 
           if (distanceTraveledRef.current + width + 100 > nextSpawnThreshold) {
             const rand = Math.random();
@@ -421,19 +509,19 @@ export default function RoadSimulation2D({
 
       // Cleanup anomalies that scrolled off-screen to the left
       anomaliesRef.current = anomaliesRef.current.filter(
-        (a) => a.worldX > distanceTraveledRef.current - 500
+        (a) => a.worldX > distanceTraveledRef.current - 600
       );
 
-      // Road geometry coordinates
-      const baselineY = height * 0.72; // Road elevation level
-      const nominalVerticalDepthCm = 65.0; // Front sensor nominal ground clearance
+      // Road geometry level on canvas
+      const baselineY = height * 0.72;
+      const nominalSensorHeightCm = 85.0; // Sensor height above road (0.85 m / 33.5 in)
 
-      // Adjustable LiDAR inclination angle: pointing forward-downward toward the right
-      const beamAngleDeg = sensorAngleDeg;
-      const beamAngleRad = (beamAngleDeg * Math.PI) / 180;
-      const sinAngle = Math.sin(beamAngleRad);
+      // FIXED 5.0 METER LIDAR RAY CONSTANTS
+      const FIXED_SLANT_DIST_CM = 500.0; // 5.0 meters (500 cm / 16.4 ft)
+      // Fixed inclination angle: sin(theta) = 85cm / 500cm = 0.170 -> theta ~ 9.79 deg
+      const FIXED_BEAM_ANGLE_RAD = Math.asin(Math.min(0.95, nominalSensorHeightCm / FIXED_SLANT_DIST_CM));
 
-      // Terrain elevation function at given screen coordinate X
+      // Terrain elevation function: registers from RIGHT (oncoming ahead) to LEFT (bike)
       const getTerrainElevationAtScreenX = (screenX) => {
         const worldX = distanceTraveledRef.current + screenX;
 
@@ -441,15 +529,15 @@ export default function RoadSimulation2D({
           const buf = hardwareTerrainBufferRef.current;
           if (buf.length > 0) {
             const newestWorldX = buf[buf.length - 1].worldX;
-            // If the query is ahead of the sensor's newest reading, assume flat ground (undiscovered)
+            // Undiscovered road ahead of the laser scan is flat
             if (worldX > newestWorldX + 5) {
               return 0;
             }
-            
-            // Find the closest buffered reading to this worldX
+
+            // Find closest buffered reading (queried from right to left)
             let matchDev = buf[buf.length - 1].devCm;
-            for (let i = 0; i < buf.length; i++) {
-              if (buf[i].worldX >= worldX) {
+            for (let i = buf.length - 1; i >= 0; i--) {
+              if (buf[i].worldX <= worldX) {
                 matchDev = buf[i].devCm;
                 break;
               }
@@ -459,7 +547,7 @@ export default function RoadSimulation2D({
           return 0;
         }
 
-        // Procedural baseline micro-elevation based on road preset
+        // Procedural baseline micro-texture based on road preset
         let baselineTexturePx = 0;
         if (roadPreset === "dirt") {
           baselineTexturePx = (Math.sin(worldX * 0.05) * 0.5 + Math.sin(worldX * 0.012) * 1.0) * pixelsPerCm;
@@ -469,29 +557,51 @@ export default function RoadSimulation2D({
           baselineTexturePx = (Math.sin(worldX * 0.10) * 0.4 + Math.cos(worldX * 0.02) * 0.6) * pixelsPerCm;
         }
 
-        // Generator mode: smooth cosine depression
+        // Generator mode: realistic steep-walled crater / distinct speed bump profile
         let totalElevationPx = baselineTexturePx;
         for (const anom of anomaliesRef.current) {
           const distToCenter = worldX - anom.worldX;
           const halfWidthPx = (anom.widthCm * pixelsPerCm) / 2;
 
-          if (Math.abs(distToCenter) < halfWidthPx) {
-            const normDist = distToCenter / halfWidthPx;
-            const factor = Math.cos(normDist * (Math.PI / 2));
+          if (Math.abs(distToCenter) <= halfWidthPx) {
+            const normDist = Math.abs(distToCenter) / halfWidthPx; // 0 at center, 1.0 at outer rim
+            let profileFactor = 0;
+
+            if (anom.type === "pothole" || anom.type === "deep_pothole") {
+              // REALISTIC STEEP-WALLED ASPHALT CRATER (Sharp edge drop, not a gentle slope)
+              // Rim drop zone: outer 15% of crater width transitions steeply into cavity
+              if (normDist > 0.85) {
+                // Steep asphalt fracture wall drop (0 at rim edge to 0.92 at cavity wall)
+                const wallT = (1.0 - normDist) / 0.15; // 0.0 to 1.0
+                profileFactor = Math.pow(Math.sin(wallT * (Math.PI / 2)), 0.4);
+              } else {
+                // Interior crater cavity floor: flat/rough broken pavement with asphalt fracture noise
+                const cavityNoise =
+                  Math.sin(worldX * 0.4) * 0.06 + Math.cos(worldX * 0.85) * 0.04;
+                profileFactor = 1.0 + cavityNoise;
+              }
+            } else if (anom.type === "bump") {
+              // Defined trapezoidal / steep-edged speed hump
+              if (normDist > 0.75) {
+                const rampT = (1.0 - normDist) / 0.25;
+                profileFactor = Math.sin(rampT * (Math.PI / 2));
+              } else {
+                profileFactor = 1.0 - Math.pow(normDist / 0.75, 2) * 0.12;
+              }
+            }
+
             const anomalyDepthPx = anom.depthCm * pixelsPerCm;
-            totalElevationPx += anomalyDepthPx * factor;
+            totalElevationPx += anomalyDepthPx * profileFactor;
           }
         }
         return totalElevationPx;
       };
 
-      // -------------------------------------------------------------
-      // 1. DRAW TECHNICAL BLACK BLUEPRINT BACKGROUND
-      // -------------------------------------------------------------
-      ctx.fillStyle = "#09090b"; // Solid black
+      // 1. DRAW CAD TECHNICAL BLUEPRINT BACKGROUND
+      ctx.fillStyle = "#09090b";
       ctx.fillRect(0, 0, width, height);
 
-      // Technical CAD coordinate grid
+      // Coordinate grid
       ctx.strokeStyle = "#18181b";
       ctx.lineWidth = 1;
       for (let x = 0; x < width; x += 40) {
@@ -507,7 +617,7 @@ export default function RoadSimulation2D({
         ctx.stroke();
       }
 
-      // Top distance ruler
+      // Top distance ruler in meters
       ctx.fillStyle = "#71717a";
       ctx.font = "9px monospace";
       const markerIntervalPx = 120;
@@ -524,17 +634,14 @@ export default function RoadSimulation2D({
         }
       }
 
-      // -------------------------------------------------------------
-      // 2. DRAW ROAD TERRAIN & CROSS-SECTION
-      // -------------------------------------------------------------
-      const step = 4;
+      // 2. DRAW ROAD TERRAIN CROSS-SECTION (High-resolution step for crisp crater edges)
+      const step = 2; // 2px fine sampling ensures sharp vertical crater walls
       const surfacePoints = [];
       for (let sx = 0; sx <= width + step; sx += step) {
         const elev = getTerrainElevationAtScreenX(sx);
         surfacePoints.push({ x: sx, y: baselineY + elev });
       }
 
-      // 2A. Clip everything to the road body cross-section
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(0, height);
@@ -546,520 +653,145 @@ export default function RoadSimulation2D({
       ctx.closePath();
       ctx.clip();
 
-      if (roadPreset === "cobble") {
-        // --- COBBLESTONE ROAD TEXTURE & PATTERNS ---
-        // Bedrock / deep soil base
-        ctx.fillStyle = "#121214";
-        ctx.fillRect(0, 0, width, height);
-
-        // Crushed sand / gravel bedding layer below pavers
-        ctx.fillStyle = "#1f1f23";
+      // Road sub-base hatching
+      ctx.fillStyle = "#121215";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = "#27272a";
+      ctx.lineWidth = 1;
+      for (let x = -height; x < width + height; x += 24) {
         ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y + 36);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y + 36);
-        }
-        ctx.lineTo(width, height);
-        ctx.lineTo(0, height);
-        ctx.closePath();
-        ctx.fill();
-
-        // Bedding sand coarse speckles
-        ctx.fillStyle = "rgba(113, 113, 122, 0.3)";
-        const sandStep = 20;
-        const sandStartX = Math.floor(distanceTraveledRef.current / sandStep) * sandStep;
-        for (let mx = sandStartX; mx < distanceTraveledRef.current + width + sandStep; mx += sandStep) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          const py = baselineY + elev + 44;
-          ctx.fillRect(sx, py + Math.abs((mx * 7) % 30), 2, 2);
-          ctx.fillRect(sx + 10, py + Math.abs((mx * 13) % 40), 1.5, 1.5);
-        }
-
-        // 3 Staggered Rows of Rectangular/Rounded Cobblestone Pavers
-        const paverW = 28;
-        const paverH = 14;
-        const numRows = 3;
-        const paverRowColors = [
-          ["#3f3f46", "#52525b", "#333338"],
-          ["#2d2d32", "#3b3b40", "#26262a"],
-          ["#222226", "#29292e", "#1c1c20"],
-        ];
-
-        for (let row = 0; row < numRows; row++) {
-          const rowOffsetY = row * paverH;
-          const stagger = (row % 2) * (paverW / 2);
-          const startX = Math.floor((distanceTraveledRef.current - stagger) / paverW) * paverW + stagger;
-
-          for (let mx = startX; mx < distanceTraveledRef.current + width + paverW; mx += paverW) {
-            const sx = mx - distanceTraveledRef.current;
-            const elev = getTerrainElevationAtScreenX(sx + paverW / 2);
-            const blockTopY = baselineY + elev + rowOffsetY;
-
-            // Pseudo-random shade per paver stone based on mx world coordinate
-            const colorIdx = Math.abs(Math.floor((mx / paverW) * 3)) % 3;
-            ctx.fillStyle = paverRowColors[row][colorIdx];
-
-            // Draw stone block with mortar margin
-            ctx.beginPath();
-            if (ctx.roundRect) {
-              ctx.roundRect(sx + 1.5, blockTopY + 1.5, paverW - 3, paverH - 3, 2);
-            } else {
-              ctx.rect(sx + 1.5, blockTopY + 1.5, paverW - 3, paverH - 3);
-            }
-            ctx.fill();
-
-            // Beveled stone highlight line on top edge of each paver
-            if (row === 0) {
-              ctx.strokeStyle = "rgba(228, 228, 231, 0.45)";
-              ctx.lineWidth = 1;
-              ctx.beginPath();
-              ctx.moveTo(sx + 3, blockTopY + 2.5);
-              ctx.lineTo(sx + paverW - 3, blockTopY + 2.5);
-              ctx.stroke();
-            }
-
-            // Dark mortar joint between stones
-            ctx.strokeStyle = "#121214";
-            ctx.lineWidth = 2;
-            ctx.strokeRect(sx + 0.5, blockTopY + 0.5, paverW - 1, paverH - 1);
-          }
-        }
-      } else if (roadPreset === "mud") {
-        // --- MUD ROAD TEXTURE & PATTERNS ---
-        // Deep subterranean peat / dark bedrock
-        ctx.fillStyle = "#0c0805";
-        ctx.fillRect(0, 0, width, height);
-
-        // Subsoil clay stratum (lower mud layer)
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y + 20);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y + 20);
-        }
-        ctx.lineTo(width, height);
-        ctx.lineTo(0, height);
-        ctx.closePath();
-        ctx.fillStyle = "#1e1109";
-        ctx.fill();
-
-        // Upper wet clay mud layer
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.lineTo(width, surfacePoints[surfacePoints.length - 1].y + 24);
-        for (let i = surfacePoints.length - 1; i >= 0; i--) {
-          ctx.lineTo(surfacePoints[i].x, surfacePoints[i].y + 24);
-        }
-        ctx.closePath();
-        ctx.fillStyle = "#33180c";
-        ctx.fill();
-
-        // Undulating organic mud rut flow striations
-        const rutOffsets = [6, 12, 18, 26];
-        const rutColors = [
-          "rgba(146, 64, 14, 0.6)",
-          "rgba(120, 53, 15, 0.45)",
-          "rgba(90, 40, 15, 0.35)",
-          "rgba(41, 24, 15, 0.5)",
-        ];
-        rutOffsets.forEach((off, idx) => {
-          ctx.save();
-          ctx.strokeStyle = rutColors[idx];
-          ctx.lineWidth = idx === 0 ? 2 : 1.5;
-          ctx.beginPath();
-          for (let i = 0; i < surfacePoints.length; i++) {
-            const p = surfacePoints[i];
-            const wave = Math.sin((distanceTraveledRef.current + p.x) * 0.03 + idx) * 2;
-            if (i === 0) ctx.moveTo(p.x, p.y + off + wave);
-            else ctx.lineTo(p.x, p.y + off + wave);
-          }
-          ctx.stroke();
-          ctx.restore();
-        });
-
-        // Embedded muddy river stones & soft clay lumps
-        ctx.fillStyle = "rgba(69, 26, 3, 0.65)";
-        const mudLumpStep = 36;
-        const mudStartX = Math.floor(distanceTraveledRef.current / mudLumpStep) * mudLumpStep;
-        for (let mx = mudStartX; mx < distanceTraveledRef.current + width + mudLumpStep; mx += mudLumpStep) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          const py = baselineY + elev + 10;
-          ctx.beginPath();
-          ctx.ellipse(sx, py + Math.abs((mx * 5) % 18), 5 + Math.abs((mx * 3) % 4), 2.5, 0.2, 0, Math.PI * 2);
-          ctx.fill();
-        }
-
-        // Wet puddle pooling in low spots / craters
-        for (const anom of anomaliesRef.current) {
-          const sx = anom.worldX - distanceTraveledRef.current;
-          const halfW = (anom.widthCm * pixelsPerCm) / 2;
-          if (anom.depthCm > 3.0 && sx > -100 && sx < width + 100) {
-            const poolY = baselineY + (anom.depthCm * pixelsPerCm * 0.45);
-            ctx.save();
-            ctx.fillStyle = "rgba(180, 83, 9, 0.35)";
-            ctx.fillRect(sx - halfW * 0.8, poolY, halfW * 1.6, anom.depthCm * pixelsPerCm);
-            // Puddle water glassy reflection surface
-            ctx.strokeStyle = "rgba(251, 191, 36, 0.5)";
-            ctx.lineWidth = 1.2;
-            ctx.beginPath();
-            ctx.moveTo(sx - halfW * 0.7, poolY);
-            ctx.lineTo(sx + halfW * 0.7, poolY);
-            ctx.stroke();
-            ctx.restore();
-          }
-        }
-      } else if (roadPreset === "dirt") {
-        // --- DIRT & GRAVEL ROAD TEXTURE & PATTERNS ---
-        // Deep packed bedrock
-        ctx.fillStyle = "#14110e";
-        ctx.fillRect(0, 0, width, height);
-
-        // Compacted hardpack clay layer
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y + 22);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y + 22);
-        }
-        ctx.lineTo(width, height);
-        ctx.lineTo(0, height);
-        ctx.closePath();
-        ctx.fillStyle = "#291e14";
-        ctx.fill();
-
-        // Upper gravel and sand wear stratum
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.lineTo(width, surfacePoints[surfacePoints.length - 1].y + 24);
-        for (let i = surfacePoints.length - 1; i >= 0; i--) {
-          ctx.lineTo(surfacePoints[i].x, surfacePoints[i].y + 24);
-        }
-        ctx.closePath();
-        ctx.fillStyle = "#4a3525";
-        ctx.fill();
-
-        // Horizontal compaction striation lines
-        ctx.save();
-        ctx.strokeStyle = "rgba(161, 98, 7, 0.3)";
-        ctx.lineWidth = 1;
-        ctx.setLineDash([12, 16]);
-        ctx.lineDashOffset = (distanceTraveledRef.current % 28);
-        ctx.beginPath();
-        for (let i = 0; i < surfacePoints.length; i++) {
-          const p = surfacePoints[i];
-          if (i === 0) ctx.moveTo(p.x, p.y + 12);
-          else ctx.lineTo(p.x, p.y + 12);
-        }
+        ctx.moveTo(x, baselineY - 20);
+        ctx.lineTo(x + height, height);
         ctx.stroke();
-        ctx.restore();
-
-        // High density of distinct gravel pebbles and stone chips
-        const pebbleStep = 26;
-        const pebbleStartX = Math.floor(distanceTraveledRef.current / pebbleStep) * pebbleStep;
-        for (let mx = pebbleStartX; mx < distanceTraveledRef.current + width + pebbleStep; mx += pebbleStep) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          const py = baselineY + elev;
-
-          // Upper fine gravel pebbles
-          ctx.fillStyle = (mx % 2 === 0) ? "#a88a6d" : "#785e45";
-          ctx.beginPath();
-          ctx.arc(sx, py + 5 + Math.abs((mx * 3) % 12), 2 + Math.abs((mx * 2) % 2), 0, Math.PI * 2);
-          ctx.fill();
-
-          // Medium sub-surface stones
-          ctx.fillStyle = (mx % 3 === 0) ? "#b48c68" : "#57422f";
-          ctx.beginPath();
-          ctx.arc(sx + 12, py + 16 + Math.abs((mx * 7) % 18), 3 + Math.abs(mx % 3), 0, Math.PI * 2);
-          ctx.fill();
-
-          // Stone contour edge
-          ctx.strokeStyle = "rgba(20, 16, 12, 0.7)";
-          ctx.lineWidth = 0.8;
-          ctx.stroke();
-        }
-
-        // Gritty sand stipple specks along the surface
-        ctx.fillStyle = "rgba(254, 215, 170, 0.4)";
-        for (let mx = pebbleStartX; mx < distanceTraveledRef.current + width + pebbleStep; mx += 14) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          ctx.fillRect(sx, baselineY + elev + 3, 1.5, 1.5);
-          ctx.fillRect(sx + 6, baselineY + elev + 7, 1.5, 1.5);
-        }
-      } else {
-        // --- ASPHALT HIGHWAY TEXTURE & PATTERNS ---
-        // Deep subgrade foundation
-        ctx.fillStyle = "#111113";
-        ctx.fillRect(0, 0, width, height);
-
-        // Crushed aggregate base course layer
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y + 16);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y + 16);
-        }
-        ctx.lineTo(width, height);
-        ctx.lineTo(0, height);
-        ctx.closePath();
-        ctx.fillStyle = "#1e1e22";
-        ctx.fill();
-
-        // Crushed angular rock aggregate matrix
-        ctx.strokeStyle = "rgba(82, 82, 91, 0.4)";
-        ctx.lineWidth = 1;
-        const stoneStep = 24;
-        const stoneStartX = Math.floor(distanceTraveledRef.current / stoneStep) * stoneStep;
-        for (let mx = stoneStartX; mx < distanceTraveledRef.current + width + stoneStep; mx += stoneStep) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          const py = baselineY + elev + 22;
-
-          // Angular fractured stone chip polygons
-          ctx.fillStyle = (mx % 2 === 0) ? "#2d2d33" : "#383840";
-          ctx.beginPath();
-          const chipOff = Math.abs((mx * 3) % 16);
-          ctx.moveTo(sx, py + chipOff);
-          ctx.lineTo(sx + 5, py + chipOff - 3);
-          ctx.lineTo(sx + 8, py + chipOff + 4);
-          ctx.lineTo(sx + 2, py + chipOff + 6);
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
-        }
-
-        // Top bituminous asphalt wearing course (dense blacktop)
-        ctx.beginPath();
-        ctx.moveTo(0, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.lineTo(width, surfacePoints[surfacePoints.length - 1].y + 16);
-        for (let i = surfacePoints.length - 1; i >= 0; i--) {
-          ctx.lineTo(surfacePoints[i].x, surfacePoints[i].y + 16);
-        }
-        ctx.closePath();
-        ctx.fillStyle = "#27272a";
-        ctx.fill();
-
-        // Asphalt fine aggregate crystalline micro-specks
-        ctx.fillStyle = "rgba(161, 161, 170, 0.35)";
-        for (let mx = stoneStartX; mx < distanceTraveledRef.current + width + stoneStep; mx += 16) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev = getTerrainElevationAtScreenX(sx);
-          ctx.fillRect(sx + 4, baselineY + elev + 4, 1.5, 1.5);
-          ctx.fillRect(sx + 10, baselineY + elev + 9, 1.2, 1.2);
-        }
       }
+      ctx.restore();
 
-      ctx.restore(); // Exit clipped cross-section
-
-      // 2B. Draw the Surface Boundary Line & Markings (Unclipped)
-      if (roadPreset === "cobble") {
-        // Cobblestone domed paver caps along the top edge
-        const paverW = 28;
-        const startX = Math.floor(distanceTraveledRef.current / paverW) * paverW;
-        for (let mx = startX; mx < distanceTraveledRef.current + width + paverW; mx += paverW) {
-          const sx = mx - distanceTraveledRef.current;
-          const elev1 = getTerrainElevationAtScreenX(sx);
-          const elevMid = getTerrainElevationAtScreenX(sx + paverW / 2);
-          const elev2 = getTerrainElevationAtScreenX(sx + paverW);
-
-          ctx.beginPath();
-          ctx.moveTo(sx, baselineY + elev1);
-          ctx.quadraticCurveTo(sx + paverW / 2, baselineY + elevMid - 2.5, sx + paverW, baselineY + elev2);
-          ctx.strokeStyle = "#e4e4e7";
-          ctx.lineWidth = 2;
-          ctx.stroke();
-
-          // Mortar gap notch
-          ctx.beginPath();
-          ctx.moveTo(sx, baselineY + elev1 - 1);
-          ctx.lineTo(sx, baselineY + elev1 + 3);
-          ctx.strokeStyle = "#18181b";
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        }
-      } else if (roadPreset === "mud") {
-        // Mud organic soft top boundary
-        ctx.beginPath();
-        ctx.moveTo(surfacePoints[0].x, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.strokeStyle = "#b45309";
-        ctx.lineWidth = 2.5;
-        ctx.stroke();
-
-        // Wet mud glossy highlight ridge
-        ctx.beginPath();
-        ctx.moveTo(surfacePoints[0].x, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y - 0.5);
-        }
-        ctx.strokeStyle = "rgba(245, 158, 11, 0.4)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      } else if (roadPreset === "dirt") {
-        // Gritty sand/dirt surface line
-        ctx.beginPath();
-        ctx.moveTo(surfacePoints[0].x, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.strokeStyle = "#e2b17a";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        // Coarse gravel ridge stipple along top
-        ctx.strokeStyle = "rgba(251, 191, 36, 0.35)";
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 6]);
-        ctx.beginPath();
-        for (let i = 0; i < surfacePoints.length; i++) {
-          const p = surfacePoints[i];
-          if (i === 0) ctx.moveTo(p.x, p.y - 1);
-          else ctx.lineTo(p.x, p.y - 1);
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-      } else {
-        // Clean Asphalt Highway Surface Line & Yellow Highway Center Markings
-        ctx.beginPath();
-        ctx.moveTo(surfacePoints[0].x, surfacePoints[0].y);
-        for (const p of surfacePoints) {
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.strokeStyle = "#ffffff";
-        ctx.lineWidth = 2.2;
-        ctx.stroke();
-
-        // Vivid Yellow Highway Center Dashes
-        const dashLength = 32;
-        const gapLength = 26;
-        const totalDashUnit = dashLength + gapLength;
-        const laneOffset = (distanceTraveledRef.current % totalDashUnit);
-
-        ctx.save();
-        ctx.strokeStyle = "#eab308"; // High-visibility highway yellow
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([dashLength, gapLength]);
-        ctx.lineDashOffset = laneOffset;
-        ctx.beginPath();
-        for (let i = 0; i < surfacePoints.length; i++) {
-          const p = surfacePoints[i];
-          if (i === 0) ctx.moveTo(p.x, p.y + 18);
-          else ctx.lineTo(p.x, p.y + 18);
-        }
-        ctx.stroke();
-        ctx.restore();
+      // Primary road surface boundary line
+      ctx.strokeStyle =
+        roadPreset === "mud"
+          ? "#d97706"
+          : roadPreset === "dirt"
+          ? "#b45309"
+          : roadPreset === "cobble"
+          ? "#a1a1aa"
+          : "#e4e4e7";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(surfacePoints[0].x, surfacePoints[0].y);
+      for (let i = 1; i < surfacePoints.length; i++) {
+        ctx.lineTo(surfacePoints[i].x, surfacePoints[i].y);
       }
+      ctx.stroke();
 
-      // -------------------------------------------------------------
-      // 3. ANOMALY LABELS ON ROAD
-      // -------------------------------------------------------------
+      // Highlight crater cavity fracture markers and sharp rims
       for (const anom of anomaliesRef.current) {
-        const sx = anom.worldX - distanceTraveledRef.current;
-        const widthPx = anom.widthCm * pixelsPerCm;
-        const depthPx = anom.depthCm * pixelsPerCm;
+        const screenCenterX = anom.worldX - distanceTraveledRef.current;
+        const halfWidthPx = (anom.widthCm * pixelsPerCm) / 2;
+        const leftRimX = screenCenterX - halfWidthPx;
+        const rightRimX = screenCenterX + halfWidthPx;
 
-        if (sx > -120 && sx < width + 120) {
-          const isPothole = anom.type.includes("pothole");
-          const isDeep = anom.type === "deep_pothole";
-          const markerColor = isDeep ? "#ef4444" : isPothole ? "#f59e0b" : "#3b82f6";
+        if (rightRimX >= 0 && leftRimX <= width) {
+          const isPotholeHazard = anom.type.includes("pothole");
+          const isDeepHazard = anom.type === "deep_pothole";
 
-          if (anom.detected) {
-            ctx.save();
-            ctx.strokeStyle = markerColor;
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([4, 4]);
-            ctx.strokeRect(sx - widthPx / 2 - 4, baselineY - 4, widthPx + 8, Math.max(depthPx + 8, 20));
+          if (isPotholeHazard) {
+            // Draw red/amber sharp rim boundary ticks
+            ctx.strokeStyle = isDeepHazard ? "#ef4444" : "#f59e0b";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(leftRimX, baselineY - 4);
+            ctx.lineTo(leftRimX, baselineY + 4);
+            ctx.moveTo(rightRimX, baselineY - 4);
+            ctx.lineTo(rightRimX, baselineY + 4);
+            ctx.stroke();
 
-            ctx.fillStyle = markerColor;
-            ctx.font = "bold 9px monospace";
-            ctx.textAlign = "center";
-            const labelY = isPothole ? baselineY - 14 : baselineY - depthPx - 14;
-            const tagTitle = isDeep
-              ? (roadPreset === "mud" ? "DEEP RUT" : roadPreset === "dirt" ? "WASHOUT" : roadPreset === "cobble" ? "SUNKEN PAVER" : "CRITICAL POTHOLE")
-              : isPothole
-                ? (roadPreset === "mud" ? "MUD HOLE" : roadPreset === "dirt" ? "DEPRESSION" : roadPreset === "cobble" ? "PAVER HOLE" : "POTHOLE")
-                : (roadPreset === "mud" ? "MUD RIDGE" : roadPreset === "dirt" ? "GRAVEL MOUND" : roadPreset === "cobble" ? "PAVER BUMP" : "BUMP");
-            ctx.fillText(`${tagTitle}: ${Math.abs(anom.depthCm)}cm`, sx, labelY);
-            ctx.restore();
+            // Cavity depth marker line
+            const cavityBottomY = baselineY + anom.depthCm * pixelsPerCm;
+            ctx.strokeStyle = isDeepHazard ? "rgba(239, 68, 68, 0.4)" : "rgba(245, 158, 11, 0.4)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath();
+            ctx.moveTo(leftRimX + 4, cavityBottomY);
+            ctx.lineTo(rightRimX - 4, cavityBottomY);
+            ctx.stroke();
+            ctx.setLineDash([]);
           }
         }
       }
 
-      // -------------------------------------------------------------
-      // 4. MOTORBIKE PROCEDURAL VECTOR MODEL (Facing Left to Right)
-      // -------------------------------------------------------------
-      // Motorbike positioned at 22% of screen width, facing RIGHT
-      const bikeScreenX = width * 0.22;
-      const wheelBase = 110; // Distance between rear axle (left) and front axle (right)
-      const wheelRadius = 18;
+      // Flat road nominal baseline reference (dashed yellow) with Base Value label
+      ctx.strokeStyle = "rgba(234, 179, 8, 0.45)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(0, baselineY);
+      ctx.lineTo(width, baselineY);
+      ctx.stroke();
+      ctx.setLineDash([]);
 
-      // Rear wheel is on the LEFT, Front wheel is on the RIGHT
-      const rearAxleX = bikeScreenX - wheelBase / 2;
-      const frontAxleX = bikeScreenX + wheelBase / 2;
+      ctx.fillStyle = "rgba(234, 179, 8, 0.7)";
+      ctx.font = "bold 9px monospace";
+      ctx.fillText(`Nominal Ground Baseline (d₀ = ${baseValueCm.toFixed(1)} cm)`, 12, baselineY - 6);
+
+      // 3. MOTORBIKE POSITION & SUSPENSION DYNAMICS
+      // Economic Commuter Motorcycle geometry (Wheelbase: 110px, Wheel radius: 18px)
+      const bikeScreenX = Math.max(90, width * 0.15);
+      const wheelRadius = 18;
+      const rearAxleX = bikeScreenX - 55;
+      const frontAxleX = bikeScreenX + 55;
 
       const rearGroundY = baselineY + getTerrainElevationAtScreenX(rearAxleX);
       const frontGroundY = baselineY + getTerrainElevationAtScreenX(frontAxleX);
 
-      // Chassis pitch angle based on terrain slope (facing right)
-      const targetPitch = Math.atan2(frontGroundY - rearGroundY, wheelBase);
-      vehicleStateRef.current.pitch += (targetPitch - vehicleStateRef.current.pitch) * 0.22;
+      const rearAxleY = rearGroundY - wheelRadius;
+      const frontAxleY = frontGroundY - wheelRadius;
+
+      // Chassis pitch angle from road slope
+      const targetPitch = Math.atan2(frontGroundY - rearGroundY, frontAxleX - rearAxleX);
+      vehicleStateRef.current.pitch += (targetPitch - vehicleStateRef.current.pitch) * 0.2;
       const pitch = vehicleStateRef.current.pitch;
 
-      const rearCenterY = rearGroundY - wheelRadius;
-      const frontCenterY = frontGroundY - wheelRadius;
-
       const chassisMidX = (rearAxleX + frontAxleX) / 2;
-      const chassisMidY = (rearCenterY + frontCenterY) / 2 - 12;
+      const chassisMidY = (rearAxleY + frontAxleY) / 2;
 
-      // Draw Rotating Motorbike Wheels
-      const drawMotorbikeWheel = (wx, wy) => {
+      // Draw Detailed Commuter Wheel (5-Spoke Star Alloy + Radial Treads + Caliper + Center Hub)
+      const drawCommuterWheel = (wx, wy) => {
         ctx.save();
         ctx.translate(wx, wy);
         ctx.rotate(vehicleStateRef.current.wheelRot);
 
-        // Outer Tire Rim (White line on dark background)
+        // Outer Rubber Tire
         ctx.beginPath();
         ctx.arc(0, 0, wheelRadius, 0, Math.PI * 2);
         ctx.strokeStyle = "#ffffff";
         ctx.lineWidth = 2.2;
         ctx.stroke();
 
-        // Inner Rim Circle
+        // Inner Alloy Rim Circle
         ctx.beginPath();
         ctx.arc(0, 0, wheelRadius - 4.5, 0, Math.PI * 2);
-        ctx.strokeStyle = "#71717a";
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = "#a1a1aa";
+        ctx.lineWidth = 1.2;
         ctx.stroke();
 
-        // Detailed Tire Tread Teeth along outer circumference
+        // 16 Tire Tread Grooves along circumference
         ctx.strokeStyle = "#ffffff";
         ctx.lineWidth = 1.2;
         const numTreads = 16;
         for (let i = 0; i < numTreads; i++) {
           const a = (i * 2 * Math.PI) / numTreads;
           const r1 = wheelRadius - 2;
-          const r2 = wheelRadius + 1.5;
+          const r2 = wheelRadius + 1.6;
           ctx.beginPath();
           ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
           ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2);
           ctx.stroke();
         }
 
-        // 6-Spoke Alloy Wheel Pattern
+        // 5-Spoke Commuter Alloy Pattern
         ctx.strokeStyle = "#e4e4e7";
-        ctx.lineWidth = 1.5;
-        const numSpokes = 6;
+        ctx.lineWidth = 1.6;
+        const numSpokes = 5;
         for (let i = 0; i < numSpokes; i++) {
           const a = (i * 2 * Math.PI) / numSpokes;
           ctx.beginPath();
@@ -1068,14 +800,14 @@ export default function RoadSimulation2D({
           ctx.stroke();
         }
 
-        // Disc Brake Caliper
+        // Disc Rotor / Drum Rim Ring
         ctx.beginPath();
-        ctx.arc(0, 0, wheelRadius - 8, 0, Math.PI * 2);
+        ctx.arc(0, 0, wheelRadius - 8.5, 0, Math.PI * 2);
         ctx.strokeStyle = "#52525b";
         ctx.lineWidth = 1;
         ctx.stroke();
 
-        // Center Axle Hub
+        // Center Axle Hub Nut
         ctx.beginPath();
         ctx.arc(0, 0, 3.5, 0, Math.PI * 2);
         ctx.fillStyle = "#ffffff";
@@ -1084,10 +816,12 @@ export default function RoadSimulation2D({
         ctx.restore();
       };
 
-      drawMotorbikeWheel(rearAxleX, rearCenterY);
-      drawMotorbikeWheel(frontAxleX, frontCenterY);
+      drawCommuterWheel(rearAxleX, rearAxleY);
+      drawCommuterWheel(frontAxleX, frontAxleY);
 
-      // Draw Motorbike Body (Facing Left to Right)
+      // 4. DRAW ECONOMIC COMMUTER MOTORCYCLE BLUEPRINT (100-125cc commuter architecture)
+      // All local coordinates relative to (chassisMidX, chassisMidY).
+      // Rear Axle is strictly at (-55, 0) and Front Axle is strictly at (55, 0).
       ctx.save();
       ctx.translate(chassisMidX, chassisMidY);
       ctx.rotate(pitch);
@@ -1097,202 +831,318 @@ export default function RoadSimulation2D({
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
 
-      // 1. Rear Swingarm (from pivot at -18,2 back to rear axle at -55,12)
+      // A. REAR WHEEL MUDGUARD (Concentric to rear axle at -55, 0)
       ctx.beginPath();
-      ctx.moveTo(-18, 2);
-      ctx.lineTo(-55, 12);
-      ctx.lineTo(-55, 6);
-      ctx.lineTo(-18, -2);
+      ctx.arc(-55, 0, wheelRadius + 3.5, -Math.PI * 0.90, -Math.PI * 0.20);
+      ctx.stroke();
+
+      // Rear Red Commuter Tail Lamp & Reflector
+      ctx.fillStyle = "#ef4444";
+      ctx.fillRect(-60, -16, 5, 8);
+      ctx.strokeStyle = "#b91c1c";
+      ctx.strokeRect(-60, -16, 5, 8);
+
+      // License Plate / Tidy Bracket
+      ctx.strokeStyle = "#71717a";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(-58, -8);
+      ctx.lineTo(-64, -2);
+      ctx.stroke();
+
+      // B. REAR COMMUTER SWINGARM (From frame pivot at -10, 4 directly to rear axle at -55, 0)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(-10, 4);
+      ctx.lineTo(-55, 0);
+      ctx.stroke();
+
+      // C. COMMUTER ENCLOSED CHAINCASE (Metal protective box from engine to rear axle)
+      ctx.strokeStyle = "#a1a1aa";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(-6, 4);
+      ctx.lineTo(-55, -2);
+      ctx.lineTo(-55, 2);
+      ctx.lineTo(-6, 7);
       ctx.closePath();
       ctx.stroke();
 
-      // Rear Monoshock Suspension Coil Spring
-      ctx.strokeStyle = "#d4d4d8";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(-32, 6);
-      ctx.lineTo(-14, -14);
-      ctx.stroke();
-
-      // 2. Engine Block & Transmission (Center)
-      ctx.strokeStyle = "#ffffff";
+      // D. DUAL REAR SHOCK ABSORBERS (From subframe mount at -36, -14 straight to swingarm at -50, 0)
+      // Chrome Damper Rod
+      ctx.strokeStyle = "#e4e4e7";
       ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.moveTo(-18, -4);
-      ctx.lineTo(16, -4);
-      ctx.lineTo(16, 12);
-      ctx.lineTo(-18, 12);
+      ctx.moveTo(-36, -14);
+      ctx.lineTo(-50, 0);
+      ctx.stroke();
+
+      // Helical Coil Spring Windings
+      ctx.strokeStyle = "#d4d4d8";
+      ctx.lineWidth = 1.8;
+      const shockSteps = 5;
+      for (let i = 1; i <= shockSteps; i++) {
+        const t = i / (shockSteps + 1);
+        const sx = -36 + t * (-50 - -36);
+        const sy = -14 + t * (0 - -14);
+        ctx.beginPath();
+        ctx.moveTo(sx - 2, sy - 2);
+        ctx.lineTo(sx + 2, sy + 2);
+        ctx.stroke();
+      }
+
+      // E. ENGINE & TRANSMISSION BLOCK (125cc Horizontal-Slanted Commuter Engine)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.8;
+      // Crankcase
+      ctx.beginPath();
+      ctx.rect(-12, 2, 20, 10);
+      ctx.stroke();
+
+      // Horizontal Cylinder & Head with Air Cooling Fins
+      ctx.beginPath();
+      ctx.moveTo(8, 2);
+      ctx.lineTo(20, -2);
+      ctx.lineTo(20, 6);
+      ctx.lineTo(8, 10);
       ctx.closePath();
       ctx.stroke();
 
-      // Engine Cylinder Cooling Fins
-      ctx.beginPath();
-      ctx.moveTo(-12, 0);
-      ctx.lineTo(10, 0);
-      ctx.moveTo(-12, 4);
-      ctx.lineTo(10, 4);
-      ctx.moveTo(-12, 8);
-      ctx.lineTo(10, 8);
-      ctx.stroke();
-
-      // 3. Compact Upswept Exhaust System (Exhaust pipe to rear left)
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(12, 4);
-      ctx.lineTo(4, 15);
-      ctx.lineTo(-16, 15);
-      ctx.lineTo(-46, 6); // Upswept muffler
-      ctx.lineTo(-58, 4);
-      ctx.stroke();
-
-      // Muffler Heat Shield
+      // Cylinder Cooling Fins
       ctx.strokeStyle = "#a1a1aa";
-      ctx.lineWidth = 1;
+      ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(-22, 12);
-      ctx.lineTo(-48, 6);
+      ctx.moveTo(10, 1); ctx.lineTo(10, 9);
+      ctx.moveTo(13, 0); ctx.lineTo(13, 8);
+      ctx.moveTo(16, -1); ctx.lineTo(16, 7);
       ctx.stroke();
 
-      // 4. Trellis Frame & Footpeg
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 1.5;
+      // Carburetor & Air Intake
+      ctx.strokeStyle = "#71717a";
+      ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(-18, 2);
-      ctx.lineTo(12, -22); // Diagonal brace
-      ctx.moveTo(0, 12);
-      ctx.lineTo(34, -28); // Lower spar to headstock
+      ctx.rect(0, -6, 6, 6);
       ctx.stroke();
 
       // Rider Footpeg
-      ctx.beginPath();
-      ctx.moveTo(-8, 12);
-      ctx.lineTo(-8, 18);
-      ctx.lineTo(-2, 18);
-      ctx.stroke();
-
-      // 5. Sculpted Fuel Tank (Facing Right)
-      ctx.beginPath();
-      ctx.moveTo(34, -28); // Headstock joint
-      ctx.lineTo(10, -34); // Tank peak
-      ctx.lineTo(-8, -20); // Tank rear / seat junction
-      ctx.lineTo(4, -14);  // Knee recess lower edge
-      ctx.closePath();
-      ctx.stroke();
-
-      // 6. Stepped Sport Rider & Pillion Seat
-      ctx.beginPath();
-      ctx.moveTo(-8, -20); // Front seat nose
-      ctx.lineTo(-30, -20); // Rider saddle dip
-      ctx.lineTo(-38, -28); // Pillion step rise
-      ctx.lineTo(-58, -28); // Tail end
-      ctx.lineTo(-52, -18); // Lower undertray
-      ctx.lineTo(-8, -16);
-      ctx.closePath();
-      ctx.stroke();
-
-      // Rear Tail Light & License Tidy (Facing Left)
-      ctx.strokeStyle = "#ef4444"; // Red tail marker
-      ctx.beginPath();
-      ctx.moveTo(-58, -28);
-      ctx.lineTo(-64, -26);
-      ctx.lineTo(-58, -22);
-      ctx.stroke();
-
-      // 7. Front Telescopic Fork Assembly (Angling down-right to front axle)
       ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.moveTo(34, -28); // Triple clamp
-      ctx.lineTo(55, 12);  // Front axle
+      ctx.moveTo(-2, 10);
+      ctx.lineTo(-2, 16);
+      ctx.lineTo(4, 16);
       ctx.stroke();
 
-      // Front Mudguard / Fender
+      // F. LONG COMMUTER EXHAUST SYSTEM & CHROME HEAT SHIELD
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.arc(55, 12, wheelRadius + 4, -Math.PI * 0.75, -Math.PI * 0.15);
+      ctx.moveTo(18, 2); // Cylinder exhaust port
+      ctx.lineTo(12, 12); // Header downpipe curve
+      ctx.lineTo(-4, 12); // Underbelly pipe
+      ctx.lineTo(-56, 4); // Long straight commuter muffler
       ctx.stroke();
 
-      // 8. Handlebars with Levers & Rear-View Mirror
-      ctx.lineWidth = 1.6;
+      // Chrome Slotted Heat Guard Plate
+      ctx.strokeStyle = "#a1a1aa";
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.moveTo(34, -28);
-      ctx.lineTo(32, -42); // Handlebar riser
-      ctx.lineTo(26, -44); // Grip
-      ctx.lineTo(32, -44); // Brake lever
+      ctx.moveTo(-16, 10);
+      ctx.lineTo(-46, 6);
       ctx.stroke();
 
-      // Mirror stalk angling up-back
+      // G. COMMUTER TUBULAR FRAME (Backbone & Twin Cradle)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.moveTo(32, -42);
-      ctx.lineTo(26, -54);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(24, -56, 3, 0, Math.PI * 2);
+      ctx.moveTo(30, -24); // Steering headstock
+      ctx.lineTo(8, -14);  // Backbone tube
+      ctx.lineTo(-10, 4);  // Swingarm pivot bracket
+      ctx.moveTo(30, -24);
+      ctx.lineTo(12, 8);   // Down-tube cradle
+      ctx.lineTo(-12, 8);  // Engine cradle
       ctx.stroke();
 
-      // 9. Aerodynamic Front Headlight Fairing / Cowl (Facing Right)
+      // H. COMMUTER FUEL TANK (Sleek utilitarian profile)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.8;
       ctx.beginPath();
-      ctx.moveTo(34, -28);
-      ctx.lineTo(48, -26); // Headlight nose
-      ctx.lineTo(48, -18);
-      ctx.lineTo(36, -14);
+      ctx.moveTo(30, -24); // Headstock junction
+      ctx.lineTo(14, -28); // Tank top peak
+      ctx.lineTo(-6, -16); // Seat nose junction
+      ctx.lineTo(4, -14);  // Knee pad lower edge
+      ctx.lineTo(24, -14);
       ctx.closePath();
       ctx.stroke();
 
-      // Headlight Lens (Facing Forward to the Right)
-      ctx.strokeStyle = "#fef08a";
+      // Chrome Fuel Cap
+      ctx.strokeStyle = "#e4e4e7";
+      ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(48, -26);
-      ctx.lineTo(48, -18);
+      ctx.arc(16, -30, 2.5, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Upper Cowl Brow & Sensor Mounting Shelf (Positioned ABOVE Headlights)
+      // Tank Rubber Knee Grip Badge
+      ctx.strokeStyle = "#71717a";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(10, -22);
+      ctx.lineTo(20, -20);
+      ctx.lineTo(18, -16);
+      ctx.lineTo(8, -16);
+      ctx.closePath();
+      ctx.stroke();
+
+      // I. LONG FLAT COMMUTER SEAT (Rider + Pillion with Rear Carrier)
       ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.moveTo(34, -28);
-      ctx.lineTo(42, -34); // Rising cowl brow line above headlight
-      ctx.lineTo(49, -34); // Sensor platform shelf
+      ctx.moveTo(-6, -16);  // Front nose
+      ctx.lineTo(-46, -16); // Seat top profile (flat & comfortable)
+      ctx.lineTo(-46, -11); // Seat base tail
+      ctx.lineTo(-6, -11);  // Seat base front
+      ctx.closePath();
       ctx.stroke();
 
-      // Strut bracket connecting cowl brow to headlight housing
+      // Side Battery Utility Panel below seat
       ctx.strokeStyle = "#71717a";
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(48, -34);
-      ctx.lineTo(48, -26);
+      ctx.rect(-24, -10, 16, 12);
       ctx.stroke();
 
-      // 10. TF02-Pro LiDAR Sensor Unit (Mounted ABOVE headlights, facing forward-down to RIGHT)
-      const sensorLocalX = 47;
-      const sensorLocalY = -34;
+      // Chrome Luggage Carrier / Pillion Grab Rail
+      ctx.strokeStyle = "#e4e4e7";
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(-38, -16);
+      ctx.lineTo(-58, -18);
+      ctx.lineTo(-58, -14);
+      ctx.lineTo(-46, -12);
+      ctx.stroke();
+
+      // J. FRONT TELESCOPIC FORK ASSEMBLY (From headstock 30,-24 straight to front axle 55,0)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(30, -24); // Triple clamp
+      ctx.lineTo(55, 0);   // Front axle hub
+      ctx.stroke();
+
+      // Rubber Accordion Fork Gaiter Boots
+      ctx.strokeStyle = "#71717a";
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(38, -16);
+      ctx.lineTo(44, -10);
+      ctx.stroke();
+
+      // K. FRONT WHEEL MUDGUARD (Concentric to front axle at 55, 0)
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(55, 0, wheelRadius + 3.5, -Math.PI * 0.80, -Math.PI * 0.15);
+      ctx.stroke();
+
+      // Mudguard Mounting Stay Strut
+      ctx.strokeStyle = "#71717a";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(55, 0);
+      ctx.lineTo(44, -14);
+      ctx.stroke();
+
+      // L. HANDLEBARS, CONTROLS & TWIN GAUGES
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(30, -24); // Clamp
+      ctx.lineTo(26, -36); // Handlebar riser
+      ctx.lineTo(20, -38); // Grip
+      ctx.stroke();
+
+      // Brake Lever
+      ctx.strokeStyle = "#a1a1aa";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(24, -37);
+      ctx.lineTo(28, -39);
+      ctx.stroke();
+
+      // Commuter Twin Round Instrument Dials (Speedometer / Fuel Gauge)
+      ctx.strokeStyle = "#e4e4e7";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(28, -38, 2.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Round Chrome Rear-View Mirror
+      ctx.strokeStyle = "#e4e4e7";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(26, -36);
+      ctx.lineTo(20, -48);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(18, -50, 3, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // M. COMMUTER HEADLIGHT & AMBER INDICATORS
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(32, -24);
+      ctx.lineTo(42, -20);
+      ctx.lineTo(42, -14);
+      ctx.lineTo(34, -16);
+      ctx.closePath();
+      ctx.stroke();
+
+      // Yellow Headlight Glass Lens
+      ctx.strokeStyle = "#fef08a";
+      ctx.lineWidth = 2.0;
+      ctx.beginPath();
+      ctx.moveTo(42, -20);
+      ctx.lineTo(42, -14);
+      ctx.stroke();
+
+      // Amber Turn Signal Indicator
+      ctx.fillStyle = "#f59e0b";
+      ctx.beginPath();
+      ctx.arc(36, -26, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // N. TF02-PRO LIDAR SENSOR UNIT & RIGID MOUNT (Mounted above headlight shelf)
+      const sensorLocalX = 44;
+      const sensorLocalY = -30;
 
       ctx.save();
       ctx.translate(sensorLocalX, sensorLocalY);
-      // Pivots dynamically according to sensorAngleDeg downward to the right
-      ctx.rotate(beamAngleRad);
+      ctx.rotate(FIXED_BEAM_ANGLE_RAD);
 
-      // LiDAR Mounting Swivel Collar
+      // LiDAR Mounting Shelf Bracket
       ctx.strokeStyle = "#71717a";
-      ctx.lineWidth = 1.2;
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
+      ctx.moveTo(-6, 4);
+      ctx.lineTo(0, 0);
       ctx.stroke();
 
-      // LiDAR Outer Casing
+      // TF02-Pro Housing
       ctx.fillStyle = "#09090b";
       ctx.fillRect(-4, -4, 12, 8);
-      ctx.strokeStyle = "#f97316"; // Fiery red-amber housing accent
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = "#f97316"; // Fiery red-amber LiDAR casing accent
+      ctx.lineWidth = 1.4;
       ctx.strokeRect(-4, -4, 12, 8);
 
-      // Optical Emitter Lens (Facing right-down)
-      ctx.fillStyle = "#ef4444"; // Vivid red lens
+      // Red Laser Emitter Lens (Facing right-downward)
+      ctx.fillStyle = "#ef4444";
       ctx.beginPath();
       ctx.arc(8, 0, 2.2, 0, Math.PI * 2);
       ctx.fill();
 
-      // Lens amber glow halo
+      // Amber Glow Halo
       ctx.strokeStyle = "#f59e0b";
       ctx.lineWidth = 0.8;
       ctx.beginPath();
@@ -1302,89 +1152,90 @@ export default function RoadSimulation2D({
       ctx.restore();
       ctx.restore(); // Exit motorbike transform
 
-      // -------------------------------------------------------------
-      // 5. LIDAR LASER BEAM RAYCAST (ADJUSTABLE ANGLE)
-      // -------------------------------------------------------------
-      // Compute global coordinates of front-mounted LiDAR lens (Mounted ABOVE headlight)
+      // 5. FIXED 5.0 METER LIDAR LASER BEAM RAYCAST
       const cosP = Math.cos(pitch);
       const sinP = Math.sin(pitch);
-      const sensorLocalOffsetX = 47;
-      const sensorLocalOffsetY = -34;
+      const sensorLocalOffsetX = 44;
+      const sensorLocalOffsetY = -30;
 
       const lidarOriginX = chassisMidX + sensorLocalOffsetX * cosP - sensorLocalOffsetY * sinP;
       const lidarOriginY = chassisMidY + sensorLocalOffsetX * sinP + sensorLocalOffsetY * cosP;
 
-      // Absolute raycast angle in world space (facing down and forward to the right)
-      const effectiveBeamAngleRad = beamAngleRad + pitch;
+      const effectiveBeamAngleRad = FIXED_BEAM_ANGLE_RAD + pitch;
       const cosBeam = Math.cos(effectiveBeamAngleRad);
       const sinBeam = Math.sin(effectiveBeamAngleRad);
 
-      // Find intersection with oncoming road terrain ahead to the right
-      let rayT = (baselineY - lidarOriginY) / Math.max(sinBeam, 0.1);
+      // Ray intersection with oncoming road terrain ahead to the right
+      let rayT = (baselineY - lidarOriginY) / Math.max(sinBeam, 0.05);
       let hitX = lidarOriginX + rayT * cosBeam;
       let hitY = baselineY + getTerrainElevationAtScreenX(hitX);
 
-      // Refine intersection along crater walls
+      // Multi-pass crater boundary refinement
       for (let iter = 0; iter < 4; iter++) {
         const terrainAtX = baselineY + getTerrainElevationAtScreenX(hitX);
         const errorY = terrainAtX - (lidarOriginY + rayT * sinBeam);
-        rayT += errorY / Math.max(sinBeam, 0.1);
+        rayT += errorY / Math.max(sinBeam, 0.05);
         hitX = lidarOriginX + rayT * cosBeam;
         hitY = baselineY + getTerrainElevationAtScreenX(hitX);
       }
 
-      // Measured Slant Range along laser path
+      // Real physical distance calculations
       const measuredSlantPx = Math.hypot(hitX - lidarOriginX, hitY - lidarOriginY);
       const measuredSlantCm = measuredSlantPx / pixelsPerCm;
+      const measuredSlantM = measuredSlantCm / 100;
+      const measuredSlantFt = measuredSlantCm / 30.48;
 
-      // Vertical clearance and deviation
-      const verticalDepthCm = (hitY - lidarOriginY) / pixelsPerCm;
-      const nominalSlantBaselineCm = nominalVerticalDepthCm / Math.max(sinAngle, 0.1);
+      const verticalHeightCm = (hitY - lidarOriginY) / pixelsPerCm;
+      const verticalHeightM = verticalHeightCm / 100;
+      const verticalHeightIn = verticalHeightCm / 2.54;
+
       const deltaVerticalCm = (hitY - baselineY) / pixelsPerCm;
+      const deltaVerticalMm = deltaVerticalCm * 10;
+      const deltaVerticalIn = deltaVerticalCm / 2.54;
 
-      // Lookahead lead distance ahead of front tire contact point
-      const leadDistanceCm = (hitX - frontAxleX) / pixelsPerCm;
+      const leadDistanceCm = Math.max(0, (hitX - frontAxleX) / pixelsPerCm);
+      const leadDistanceM = leadDistanceCm / 100;
+      const leadDistanceFt = leadDistanceCm / 30.48;
 
-      // Anomaly detection rules
+      const timeToImpactMs = speedMps > 0 ? Math.round((leadDistanceM / speedMps) * 1000) : 9999;
+
+      // Anomaly thresholds
       const potThresh = settings?.pot_thresh || 4.5;
       const deepThresh = settings?.deep_thresh || 8.0;
       const bumpThresh = settings?.bump_thresh || 4.5;
 
-      let isPothole = deltaVerticalCm > potThresh;
-      let isDeep = deltaVerticalCm > deepThresh;
-      let isBump = deltaVerticalCm < -bumpThresh;
-      let isAnomaly = isPothole || isBump;
+      const isPothole = deltaVerticalCm > potThresh;
+      const isDeep = deltaVerticalCm > deepThresh;
+      const isBump = deltaVerticalCm < -bumpThresh;
+      const isAlert = isPothole || isBump;
 
-      // Surface Type Title
+      // Surface Classification
       let nominalTitle = "Nominal Asphalt";
       if (roadPreset === "mud") nominalTitle = "Nominal Mud Track";
       else if (roadPreset === "dirt") nominalTitle = "Nominal Dirt Road";
       else if (roadPreset === "cobble") nominalTitle = "Nominal Cobblestone";
 
       let activeClass = nominalTitle;
+      let severityLabel = "None";
       if (isDeep) {
-        if (roadPreset === "mud") activeClass = "Deep Mud Rut";
-        else if (roadPreset === "dirt") activeClass = "Severe Washout";
-        else if (roadPreset === "cobble") activeClass = "Sunken Paver Pit";
-        else activeClass = "Deep Pothole";
+        severityLabel = "Critical";
+        activeClass = roadPreset === "mud" ? "Deep Mud Rut" : roadPreset === "dirt" ? "Severe Washout" : roadPreset === "cobble" ? "Sunken Paver Pit" : "Deep Pothole";
       } else if (isPothole) {
-        if (roadPreset === "mud") activeClass = "Mud Pothole";
-        else if (roadPreset === "dirt") activeClass = "Gravel Depression";
-        else if (roadPreset === "cobble") activeClass = "Loose Paver Hole";
-        else activeClass = "Shallow Pothole";
+        severityLabel = "Moderate";
+        activeClass = roadPreset === "mud" ? "Mud Pothole" : roadPreset === "dirt" ? "Gravel Depression" : roadPreset === "cobble" ? "Loose Paver Hole" : "Shallow Pothole";
       } else if (isBump) {
-        if (roadPreset === "mud") activeClass = "Mud Ridge";
-        else if (roadPreset === "dirt") activeClass = "Gravel Mound";
-        else if (roadPreset === "cobble") activeClass = "Raised Paver Stone";
-        else activeClass = "Speed Bump";
+        severityLabel = "Caution";
+        activeClass = roadPreset === "mud" ? "Mud Ridge" : roadPreset === "dirt" ? "Gravel Mound" : roadPreset === "cobble" ? "Raised Paver Stone" : "Speed Bump";
       }
 
-      // Flag oncoming anomaly in generator mode
+      // Generator mode anomaly confirmation
+      let activeScannedHazard = null;
       if (simMode === "generator") {
         for (const anom of anomaliesRef.current) {
           const worldHitX = distanceTraveledRef.current + hitX;
           const halfWidthPx = (anom.widthCm * pixelsPerCm) / 2;
           if (Math.abs(worldHitX - anom.worldX) < halfWidthPx) {
+            activeScannedHazard = anom;
             if (!anom.detected) {
               anom.detected = true;
               detectedCountRef.current += 1;
@@ -1393,32 +1244,11 @@ export default function RoadSimulation2D({
               const isPotholeAnom = anom.type === "pothole";
               let detectedTypeName = "Speed Bump";
               if (isDeepAnom) {
-                detectedTypeName =
-                  roadPreset === "mud"
-                    ? "Deep Mud Rut"
-                    : roadPreset === "dirt"
-                    ? "Severe Washout"
-                    : roadPreset === "cobble"
-                    ? "Sunken Paver Pit"
-                    : "Deep Pothole";
+                detectedTypeName = roadPreset === "mud" ? "Deep Mud Rut" : roadPreset === "dirt" ? "Severe Washout" : roadPreset === "cobble" ? "Sunken Paver Pit" : "Deep Pothole";
               } else if (isPotholeAnom) {
-                detectedTypeName =
-                  roadPreset === "mud"
-                    ? "Mud Pothole"
-                    : roadPreset === "dirt"
-                    ? "Gravel Depression"
-                    : roadPreset === "cobble"
-                    ? "Loose Paver Hole"
-                    : "Shallow Pothole";
+                detectedTypeName = roadPreset === "mud" ? "Mud Pothole" : roadPreset === "dirt" ? "Gravel Depression" : roadPreset === "cobble" ? "Loose Paver Hole" : "Shallow Pothole";
               } else {
-                detectedTypeName =
-                  roadPreset === "mud"
-                    ? "Mud Ridge"
-                    : roadPreset === "dirt"
-                    ? "Gravel Mound"
-                    : roadPreset === "cobble"
-                    ? "Raised Paver Stone"
-                    : "Speed Bump";
+                detectedTypeName = roadPreset === "mud" ? "Mud Ridge" : roadPreset === "dirt" ? "Gravel Mound" : roadPreset === "cobble" ? "Raised Paver Stone" : "Speed Bump";
               }
 
               const detectedObj = {
@@ -1427,15 +1257,22 @@ export default function RoadSimulation2D({
                 type: detectedTypeName,
                 deviation_cm: `${anom.depthCm > 0 ? "+" : ""}${anom.depthCm.toFixed(1)}`,
                 depth_cm: Math.abs(anom.depthCm),
+                depth_in: Math.round((Math.abs(anom.depthCm) / 2.54) * 10) / 10,
                 length_cm: anom.widthCm,
+                length_ft: Math.round((anom.widthCm / 30.48) * 10) / 10,
                 width_cm: Math.round(anom.widthCm * 0.8),
-                severity: Math.abs(anom.depthCm) >= 8.0 ? "Critical" : "Moderate",
+                severity: Math.abs(anom.depthCm) >= 8.0 ? "Deep / Dangerous" : "Shallow",
                 confidence: "98%",
+                strength: 1100,
+                baseline: `${baseValueCm.toFixed(0)}`,
                 slant_range_cm: Math.round(measuredSlantCm * 10) / 10,
-                angle_deg: Number(sensorAngleDeg.toFixed(2)),
+                slant_range_m: Math.round(measuredSlantM * 100) / 100,
+                slant_range_ft: Math.round(measuredSlantFt * 10) / 10,
+                lead_dist_m: Math.round(leadDistanceM * 100) / 100,
+                lead_dist_ft: Math.round(leadDistanceFt * 10) / 10,
               };
 
-              setSessionDetections((prev) => [detectedObj, ...prev.slice(0, 19)]);
+              setSessionDetections((prev) => [detectedObj, ...prev.slice(0, 49)]);
 
               if (onSimulatedAnomaly) {
                 onSimulatedAnomaly(detectedObj);
@@ -1445,291 +1282,210 @@ export default function RoadSimulation2D({
         }
       }
 
-      // Hardware mode: detect anomalies from real LiDAR deviation in telemetry
-      // Detections are driven entirely by the backend classification — no fake logic here.
+      // Update state for HUD display
+      setHudStats({
+        speedKmph: simSpeedKmph,
+        speedMps: Math.round(speedMps * 100) / 100,
+        speedMph: Math.round(speedMph * 10) / 10,
+        slantDistanceCm: Math.round(measuredSlantCm * 10) / 10,
+        slantDistanceM: Math.round(measuredSlantM * 100) / 100,
+        slantDistanceFt: Math.round(measuredSlantFt * 10) / 10,
+        baseValueCm: Math.round(baseValueCm * 10) / 10,
+        baseValueM: Math.round((baseValueCm / 100) * 100) / 100,
+        baseValueFt: Math.round((baseValueCm / 30.48) * 10) / 10,
+        verticalDepthCm: Math.round(verticalHeightCm * 10) / 10,
+        verticalDepthM: Math.round(verticalHeightM * 100) / 100,
+        verticalDepthIn: Math.round(verticalHeightIn * 10) / 10,
+        deviationCm: Math.round(deltaVerticalCm * 10) / 10,
+        deviationMm: Math.round(deltaVerticalMm),
+        deviationIn: Math.round(deltaVerticalIn * 100) / 100,
+        earlyWarningLeadCm: Math.round(leadDistanceCm),
+        earlyWarningLeadM: Math.round(leadDistanceM * 100) / 100,
+        earlyWarningLeadFt: Math.round(leadDistanceFt * 10) / 10,
+        timeToImpactMs,
+        surfaceType: activeClass,
+        isAlert,
+        severity: severityLabel,
+        detectedCount: simMode === "generator" ? detectedCountRef.current : (potholeCount + bumpCount),
+        activeHazard: activeScannedHazard,
+      });
 
-      // Draw Laser Beam in Red-Amber Mixed Color (Shooting down-right ahead of bike)
+      // 6. DRAW LASER BEAM (FIERY RED-AMBER MIXED)
       ctx.save();
-
-      // Create fiery red-amber mixed linear gradient from sensor emitter to pavement contact
-      const beamGrad = ctx.createLinearGradient(lidarOriginX, lidarOriginY, hitX, hitY);
-
-      if (isDeep) {
-        beamGrad.addColorStop(0, "#dc2626"); // Crimson lens emitter
-        beamGrad.addColorStop(0.35, "#ef4444"); // Intense red core
-        beamGrad.addColorStop(0.75, "#f97316"); // Red-amber
-        beamGrad.addColorStop(1, "#fbbf24"); // Amber flare on crater bed
-      } else if (isPothole) {
-        beamGrad.addColorStop(0, "#ef4444"); // Red lens emitter
-        beamGrad.addColorStop(0.45, "#f97316"); // Red-amber
-        beamGrad.addColorStop(1, "#f59e0b"); // Golden amber impact
-      } else if (isBump) {
-        beamGrad.addColorStop(0, "#f97316"); // Red-amber
-        beamGrad.addColorStop(0.5, "#f59e0b"); // Golden amber
-        beamGrad.addColorStop(1, "#fbbf24"); // Light amber
-      } else {
-        // Nominal red-amber mixed laser beam
-        beamGrad.addColorStop(0, "#ef4444"); // Vivid crimson red at lens
-        beamGrad.addColorStop(0.4, "#ea580c"); // Rich red-orange
-        beamGrad.addColorStop(0.7, "#f97316"); // Warm red-amber
-        beamGrad.addColorStop(1, "#f59e0b"); // Golden amber at pavement contact
-      }
-
-      // Outer glowing beam
-      ctx.strokeStyle = beamGrad;
-      ctx.lineWidth = isAnomaly ? 3.0 : 2.0;
-      ctx.shadowColor = isAnomaly ? "#ef4444" : "#f97316";
-      ctx.shadowBlur = isAnomaly ? 14 : 7;
-
+      // Outer glow
+      ctx.strokeStyle = isDeep ? "rgba(239, 68, 68, 0.45)" : isAlert ? "rgba(245, 158, 11, 0.45)" : "rgba(249, 115, 22, 0.35)";
+      ctx.lineWidth = 5;
       ctx.beginPath();
       ctx.moveTo(lidarOriginX, lidarOriginY);
       ctx.lineTo(hitX, hitY);
       ctx.stroke();
 
-      // Inner high-intensity laser core filament (incandescent warm white-amber core)
-      ctx.shadowBlur = 0;
-      ctx.strokeStyle = isAnomaly ? "rgba(254, 202, 202, 0.85)" : "rgba(254, 243, 199, 0.8)";
-      ctx.lineWidth = 0.8;
+      // Inner intense core beam
+      ctx.strokeStyle = isDeep ? "#ef4444" : isAlert ? "#f59e0b" : "#ffedd5";
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
       ctx.moveTo(lidarOriginX, lidarOriginY);
       ctx.lineTo(hitX, hitY);
       ctx.stroke();
 
-      // Laser impact reticle on pavement
-      ctx.fillStyle = isAnomaly ? "#ef4444" : "#f97316";
-      ctx.shadowColor = "#f59e0b";
-      ctx.shadowBlur = isAnomaly ? 10 : 5;
+      // Laser impact spot on ground
+      ctx.fillStyle = isDeep ? "#ef4444" : isAlert ? "#f59e0b" : "#f97316";
       ctx.beginPath();
-      ctx.arc(hitX, hitY, isAnomaly ? 4.5 : 3.0, 0, Math.PI * 2);
+      ctx.arc(hitX, hitY, 4, 0, Math.PI * 2);
       ctx.fill();
 
-      // Outer concentric ring around impact
-      ctx.strokeStyle = isAnomaly ? "#ef4444" : "#fbbf24";
+      // Impact halo rings
+      ctx.strokeStyle = isDeep ? "rgba(239, 68, 68, 0.6)" : "rgba(249, 115, 22, 0.6)";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(hitX, hitY, isAnomaly ? 7.5 : 5.0, 0, Math.PI * 2);
+      ctx.arc(hitX, hitY, 7, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Expanding detection shockwave pulse on alert
-      if (isAnomaly) {
-        const pulseRadius = ((now % 600) / 600) * 20 + 4;
-        ctx.beginPath();
-        ctx.arc(hitX, hitY, pulseRadius, 0, Math.PI * 2);
-        ctx.strokeStyle = isDeep ? "#ef4444" : "#f97316";
-        ctx.lineWidth = 1.5;
-        ctx.globalAlpha = Math.max(0, 1 - (pulseRadius / 24));
-        ctx.stroke();
-      }
-
-      // Measurement Callout Tag along inclined beam
-      ctx.globalAlpha = 1.0;
-      ctx.shadowBlur = 0;
-      const midBeamX = (lidarOriginX + hitX) / 2;
-      const midBeamY = (lidarOriginY + hitY) / 2;
-
-      ctx.fillStyle = "#18181b";
-      ctx.fillRect(midBeamX + 10, midBeamY - 12, 120, 22);
-      ctx.strokeStyle = isAnomaly ? "#ef4444" : "#f97316";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(midBeamX + 10, midBeamY - 12, 120, 22);
-
-      ctx.fillStyle = isAnomaly ? "#fca5a5" : "#fdba74";
+      // Mid-beam telemetry label
+      const midX = (lidarOriginX + hitX) / 2;
+      const midY = (lidarOriginY + hitY) / 2;
+      ctx.fillStyle = "#f97316";
       ctx.font = "bold 9px monospace";
-      ctx.textAlign = "left";
-      ctx.fillText(`${sensorAngleDeg.toFixed(1)}° | R ${measuredSlantCm.toFixed(1)}cm`, midBeamX + 14, midBeamY + 2);
+      ctx.fillText(`5.0m Ray (R: ${measuredSlantM.toFixed(2)}m / ${measuredSlantFt.toFixed(1)}ft)`, midX + 12, midY - 6);
 
-      // Early Warning Lookahead Bracket ahead of front wheel
-      if (isAnomaly) {
-        ctx.strokeStyle = isAnomaly ? "#ef4444" : "#f97316";
-        ctx.setLineDash([2, 2]);
+      // 7. FLOATING HAZARD CALLOUT OVER ACTIVE DETECTED ROAD ANOMALY
+      if (isAlert) {
+        ctx.save();
+        ctx.translate(hitX, hitY - 32);
+
+        // Callout Tag Background
+        ctx.fillStyle = isDeep ? "rgba(220, 38, 38, 0.95)" : "rgba(217, 119, 6, 0.95)";
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(frontAxleX, baselineY);
-        ctx.lineTo(hitX, baselineY);
+        ctx.roundRect(-55, -14, 110, 24, [4]);
+        ctx.fill();
         ctx.stroke();
 
-        ctx.fillStyle = isAnomaly ? "#fca5a5" : "#fdba74";
-        ctx.font = "8px monospace";
+        // Pin pointer triangle
+        ctx.beginPath();
+        ctx.moveTo(-5, 10);
+        ctx.lineTo(0, 18);
+        ctx.lineTo(5, 10);
+        ctx.fill();
+
+        // Text in Callout
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 9px monospace";
         ctx.textAlign = "center";
-        ctx.fillText(`Lead: ${leadDistanceCm.toFixed(0)}cm`, (frontAxleX + hitX) / 2, baselineY + 12);
+        ctx.fillText(
+          `${deltaVerticalCm > 0 ? "POTHOLE" : "BUMP"} ${Math.abs(deltaVerticalCm).toFixed(1)}cm`,
+          0,
+          -2
+        );
+        ctx.font = "8px monospace";
+        ctx.fillText(`Lead: ${leadDistanceM.toFixed(2)}m | ${timeToImpactMs}ms`, 0, 7);
+
+        ctx.restore();
       }
 
       ctx.restore();
 
-      // -------------------------------------------------------------
-      // 6. SYNC HUD STATS FOR UI OVERLAY
-      // -------------------------------------------------------------
-      setHudStats({
-        speedKmph: simSpeedKmph,
-        slantDistanceCm: Math.round(measuredSlantCm * 10) / 10,
-        verticalDepthCm: Math.round(verticalDepthCm * 10) / 10,
-        deviationCm: Math.round(deltaVerticalCm * 10) / 10,
-        surfaceType: activeClass,
-        isAlert: isAnomaly,
-        severity: isDeep ? "Critical" : isPothole ? "Shallow" : isBump ? "Bump" : "Normal",
-        detectedCount: detectedCountRef.current,
-        earlyWarningLeadCm: Math.max(0, Math.round(leadDistanceCm)),
-      });
-
-      ctx.restore(); // Restore DPR scaling
-
-      if (isRunning) {
-        animFrameRef.current = requestAnimationFrame(render);
-      }
+      ctx.restore(); // Restore high-DPI scaling
+      animFrameRef.current = requestAnimationFrame(render);
     };
 
     animFrameRef.current = requestAnimationFrame(render);
-
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  }, [isRunning, simSpeedKmph, simMode, autoSpawn, settings, spawnAnomaly, onSimulatedAnomaly, isHardwareAvailable, sensorAngleDeg, roadPreset]);
+  }, [
+    isRunning,
+    simSpeedKmph,
+    simMode,
+    autoSpawn,
+    settings,
+    spawnAnomaly,
+    onSimulatedAnomaly,
+    isHardwareAvailable,
+    roadPreset,
+    baseValueCm,
+    potholeCount,
+    bumpCount,
+  ]);
 
   return (
-    <div className="space-y-4">
-      {/* Simulation Command Bar */}
-      <div className="bg-white border border-zinc-200 rounded-lg p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-        <div className="flex items-center space-x-3">
-          <div className="p-2 bg-zinc-900 text-white rounded-md">
-            <Bike className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="flex items-center space-x-2">
-              <h2 className="text-sm font-semibold text-zinc-950 uppercase tracking-wider">
-                2D Simulation
-              </h2>
-            </div>
+    <div className="space-y-4 font-sans">
+      {/* Simulation Master Control Bar */}
+      <div className="bg-white border border-zinc-200 rounded-lg p-3 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+        {/* Left: Play / Reset / Presets */}
+        <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+          <button
+            onClick={() => setIsRunning(!isRunning)}
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
+              isRunning
+                ? "bg-zinc-900 text-white hover:bg-zinc-800 shadow-xs"
+                : "bg-emerald-600 text-white hover:bg-emerald-500 shadow-xs"
+            }`}
+          >
+            {isRunning ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+            <span>{isRunning ? "Pause (Space)" : "Resume (Space)"}</span>
+          </button>
+
+          <button
+            onClick={handleReset}
+            title="Reset Simulation Distance and Anomaly Log (Key R)"
+            className="flex items-center space-x-1 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white text-zinc-700 hover:bg-zinc-50 border border-zinc-300 transition"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-zinc-500" />
+            <span className="hidden sm:inline">Reset</span>
+          </button>
+
+          <div className="h-5 w-px bg-zinc-200 mx-1"></div>
+
+          {/* Road Surface Selector */}
+          <div className="flex items-center space-x-1">
+            <span className="text-[10px] uppercase font-mono text-zinc-400 mr-1 hidden sm:inline">Terrain:</span>
+            {ROAD_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                onClick={() => handlePresetChange(preset.id)}
+                title={`${preset.label} - ${preset.desc} (Key P to cycle)`}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md border transition flex items-center space-x-1.5 ${
+                  roadPreset === preset.id
+                    ? "bg-zinc-900 text-white border-zinc-900 font-semibold shadow-xs"
+                    : "bg-white text-zinc-700 border-zinc-200 hover:bg-zinc-50"
+                }`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${preset.dot}`}></span>
+                <span>{preset.label}</span>
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* Action Controls & Mode Switch */}
-        <div className="flex items-center space-x-2 flex-wrap gap-y-1.5">
-          {/* Mode Selector */}
-          <div className="flex items-center bg-zinc-100 p-0.5 rounded-md border border-zinc-200 text-xs">
-            <button
-              onClick={() => setSimMode("generator")}
-              className={`px-2.5 py-1 rounded font-medium transition-colors ${simMode === "generator"
-                ? "bg-white text-zinc-900 shadow-xs"
-                : "text-zinc-500 hover:text-zinc-900"
-                }`}
-            >
-              Autonomous Road
-            </button>
-
-            <button
-              onClick={() => {
-                if (isHardwareAvailable) {
-                  setSimMode("hardware");
-                }
-              }}
-              disabled={!isHardwareAvailable}
-              title={
-                isHardwareAvailable
-                  ? "Sync simulation terrain directly to live physical TF02-Pro LiDAR stream"
-                  : "Hardware Not Detected: Connect a physical TF02-Pro LiDAR via USB serial to enable live sync"
-              }
-              className={`flex items-center space-x-1 px-2.5 py-1 rounded font-medium transition-colors ${simMode === "hardware" && isHardwareAvailable
-                ? "bg-white text-zinc-900 shadow-xs"
-                : isHardwareAvailable
-                  ? "text-zinc-500 hover:text-zinc-900"
-                  : "text-zinc-400 cursor-not-allowed opacity-60"
-                }`}
-            >
-              {!isHardwareAvailable && <Lock className="w-3 h-3 text-zinc-400" />}
-              <span>Hardware Sync</span>
-            </button>
-          </div>
-
-          {/* Road Surface Preset Selector */}
-          <div className="flex items-center bg-zinc-100 p-0.5 rounded-md border border-zinc-200 text-xs">
-            <span className="px-2 py-0.5 text-[10px] font-mono text-zinc-400 uppercase hidden md:inline">Road:</span>
-            {ROAD_PRESETS.map((p) => {
-              const isSelected = roadPreset === p.id;
-              return (
-                <button
-                  key={p.id}
-                  onClick={() => handlePresetChange(p.id)}
-                  title={`${p.label}: ${p.desc} (Key P to cycle)`}
-                  className={`flex items-center space-x-1.5 px-2.5 py-1 rounded font-medium transition-colors ${isSelected
-                    ? "bg-white text-zinc-900 shadow-xs font-semibold"
-                    : "text-zinc-500 hover:text-zinc-900"
-                    }`}
-                >
-                  <span className={`w-2 h-2 rounded-full border ${p.dot}`} />
-                  <span>{p.label}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Play / Pause Toggle */}
-          <button
-            onClick={() => setIsRunning(!isRunning)}
-            title="Toggle simulation playback (Space)"
-            className="flex items-center space-x-1.5 px-3 py-1 text-xs font-medium border border-zinc-300 rounded-md hover:bg-zinc-50 text-zinc-700 bg-white transition"
-          >
-            {isRunning ? (
-              <>
-                <Pause className="w-3.5 h-3.5 text-zinc-500" />
-                <span>Pause</span>
-              </>
-            ) : (
-              <>
-                <Play className="w-3.5 h-3.5 text-zinc-500" />
-                <span>Resume</span>
-              </>
-            )}
-            <kbd className="hidden sm:inline px-1 py-0.2 bg-zinc-100 text-[10px] text-zinc-500 rounded border border-zinc-200 font-mono">Space</kbd>
-          </button>
-
-          {/* Reset Simulation Button */}
-          <button
-            onClick={() => {
-              handleReset();
-              if (onResetSimulation) onResetSimulation();
-            }}
-            title="Reset simulation distance, detected potholes, and road terrain (R)"
-            className="flex items-center space-x-1.5 px-3 py-1 text-xs font-medium border border-zinc-300 rounded-md hover:bg-zinc-50 text-zinc-700 bg-white transition"
-          >
-            <RefreshCw className="w-3.5 h-3.5 text-zinc-500" />
-            <span>Reset Sim</span>
-            <kbd className="hidden sm:inline px-1 py-0.2 bg-zinc-100 text-[10px] text-zinc-500 rounded border border-zinc-200 font-mono">R</kbd>
-          </button>
-
-          {/* Keyboard Shortcuts Trigger Button */}
-          <button
-            onClick={() => setShowShortcutsModal(true)}
-            title="View keyboard shortcuts cheat sheet (or press ?)"
-            className="flex items-center space-x-1.5 px-2.5 py-1 text-xs font-medium border border-zinc-300 rounded-md hover:bg-zinc-50 text-zinc-700 bg-white transition"
-          >
-            <Keyboard className="w-3.5 h-3.5 text-zinc-500" />
-            <span className="hidden sm:inline">Shortcuts</span>
-            <kbd className="px-1 py-0.2 text-[10px] font-mono bg-zinc-100 text-zinc-500 border border-zinc-200 rounded">?</kbd>
-          </button>
-
-          {/* Quick Anomaly Spawner */}
+        {/* Right: Manual Hazard Spawners */}
+        <div className="flex items-center space-x-1.5 flex-wrap gap-y-1">
           {simMode === "generator" && (
-            <div className="flex items-center space-x-1.5">
-              <button
-                onClick={() => spawnAnomaly("deep_pothole")}
-                title="Spawn deep crater pothole (Key 1)"
-                className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium bg-red-50 text-red-700 border border-red-200 rounded-md hover:bg-red-100 transition"
-              >
-                <Plus className="w-3 h-3" />
-                <span>Deep Pothole</span>
-                <kbd className="hidden md:inline px-1 text-[9px] font-mono bg-white/80 border border-red-200 rounded text-red-700">1</kbd>
-              </button>
+            <div className="flex items-center space-x-1">
               <button
                 onClick={() => spawnAnomaly("pothole")}
-                title="Spawn shallow road pothole (Key 2)"
+                title="Spawn shallow pothole (Key 1)"
                 className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium bg-amber-50 text-amber-800 border border-amber-200 rounded-md hover:bg-amber-100 transition"
               >
                 <Plus className="w-3 h-3" />
-                <span>Shallow Pothole</span>
-                <kbd className="hidden md:inline px-1 text-[9px] font-mono bg-white/80 border border-amber-200 rounded text-amber-800">2</kbd>
+                <span>Pothole</span>
+                <kbd className="hidden md:inline px-1 text-[9px] font-mono bg-white/80 border border-amber-200 rounded text-amber-800">1</kbd>
               </button>
+
+              <button
+                onClick={() => spawnAnomaly("deep_pothole")}
+                title="Spawn deep hazardous pothole (Key 2)"
+                className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium bg-red-50 text-red-800 border border-red-200 rounded-md hover:bg-red-100 transition"
+              >
+                <Plus className="w-3 h-3" />
+                <span>Deep Pothole</span>
+                <kbd className="hidden md:inline px-1 text-[9px] font-mono bg-white/80 border border-red-200 rounded text-red-800">2</kbd>
+              </button>
+
               <button
                 onClick={() => spawnAnomaly("bump")}
-                title="Spawn road speed bump (Key 3)"
+                title="Spawn speed bump (Key 3)"
                 className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium bg-blue-50 text-blue-800 border border-blue-200 rounded-md hover:bg-blue-100 transition"
               >
                 <Plus className="w-3 h-3" />
@@ -1738,160 +1494,135 @@ export default function RoadSimulation2D({
               </button>
             </div>
           )}
+
+          <button
+            onClick={() => setShowShortcutsModal(true)}
+            title="Keyboard Shortcuts (?)"
+            className="p-1.5 text-zinc-500 hover:text-zinc-900 rounded-md hover:bg-zinc-100 border border-zinc-200 transition"
+          >
+            <Keyboard className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
 
-      {/* Sensor Angle & Mounting Alignment Control Bar */}
-      <div className="bg-white border border-zinc-200 rounded-lg p-3 flex flex-wrap items-center justify-between gap-3 shadow-xs">
-        <div className="flex items-center space-x-3 flex-wrap gap-y-2">
-          {/* Angle Heading & Badge */}
-          <div className="flex items-center space-x-2">
-            <div className="p-1.5 bg-orange-50 text-orange-600 rounded border border-orange-200">
-              <Sliders className="w-4 h-4" />
-            </div>
-            <span className="text-xs font-semibold text-zinc-900 uppercase tracking-wider">
-              Sensor Angle (θ):
-            </span>
-            <span className="px-2 py-0.5 bg-zinc-900 text-white rounded font-mono font-bold text-xs shadow-xs">
-              {sensorAngleDeg.toFixed(2)}°
-            </span>
+      {/* Primary LiDAR Telemetry & Base Value Metric Bar (7 Cards) */}
+      <div className="bg-white border border-zinc-200 rounded-lg p-3 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 shadow-xs font-mono">
+        {/* 1. Sensor Baseline / Base Value (d0) */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Sensor Base (d₀)</span>
+            <Compass className="w-3 h-3 text-zinc-400" />
           </div>
-
-          {/* Interactive Range Slider */}
-          <div className="flex items-center space-x-2 pl-2">
-            <span className="text-[10px] font-mono text-zinc-400">25°</span>
-            <input
-              type="range"
-              min="25.0"
-              max="50.0"
-              step="0.5"
-              value={sensorAngleDeg}
-              onChange={(e) => handleAngleChange(parseFloat(e.target.value))}
-              aria-label="Adjust sensor inclination angle"
-              className="w-28 sm:w-40 accent-orange-600 cursor-pointer h-1.5"
-            />
-            <span className="text-[10px] font-mono text-zinc-400">50°</span>
-          </div>
-
-          {/* Stepper Nudge Buttons */}
-          <div className="flex items-center space-x-1">
-            <button
-              onClick={() => handleAngleChange(sensorAngleDeg - 0.5)}
-              title="Angle down by 0.5 degrees (Key D or [ )"
-              className="px-1.5 py-0.5 text-xs font-mono bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded border border-zinc-200 transition"
-            >
-              -0.5° <span className="text-[9px] text-zinc-500 font-sans font-semibold">[D]</span>
-            </button>
-            <button
-              onClick={() => handleAngleChange(sensorAngleDeg + 0.5)}
-              title="Angle moveUp by 0.5 degrees (Key A or ] )"
-              className="px-1.5 py-0.5 text-xs font-mono bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded border border-zinc-200 transition"
-            >
-              +0.5° <span className="text-[9px] text-zinc-500 font-sans font-semibold">[A]</span>
-            </button>
-          </div>
+          <span className="text-xs font-bold text-amber-700 block mt-0.5">{hudStats.baseValueCm} cm</span>
+          <span className="text-[10px] text-zinc-500 truncate block">
+            {isHardwareAvailable
+              ? isCalibrated
+                ? "Auto-Calibrated (20-pt mean)"
+                : `Calibrating (${warmupCount}/${warmupTotal})`
+              : `${hudStats.baseValueM} m | ${hudStats.baseValueFt} ft`}
+          </span>
         </div>
 
-        {/* Quick Angle Presets & Lookahead Lead Readout */}
-        <div className="flex items-center space-x-2 flex-wrap gap-y-1">
-          <span className="text-[10px] font-mono text-zinc-400 uppercase">Presets:</span>
-          {[
-            { label: "25.0°", val: 25.0, desc: "Min Angle" },
-            { label: "30.0°", val: 30.0, desc: "Long Range" },
-            { label: "43.20°", val: 43.20, desc: "Default Calibrated", def: true },
-            { label: "50.0°", val: 50.0, desc: "Max Angle" },
-          ].map((preset) => {
-            const isSelected = Math.abs(sensorAngleDeg - preset.val) < 0.05;
-            return (
-              <button
-                key={preset.val}
-                onClick={() => handleAngleChange(preset.val)}
-                title={`${preset.desc} (${preset.val}°)`}
-                className={`px-2 py-0.5 text-xs font-mono rounded border transition-colors ${isSelected
-                  ? "bg-orange-600 text-white border-orange-700 font-bold shadow-xs"
-                  : "bg-zinc-50 hover:bg-zinc-100 text-zinc-700 border-zinc-200"
-                  }`}
-              >
-                {preset.label}
-                {preset.def && !isSelected && (
-                  <span className="ml-1 text-[9px] text-orange-600 font-semibold">DEF</span>
-                )}
-              </button>
-            );
-          })}
-
-          {/* Theoretical Lookahead distance preview */}
-          <div className="hidden md:flex items-center ml-2 pl-2 border-l border-zinc-200 text-xs font-mono text-zinc-600">
-            <span className="text-zinc-400 mr-1">Tire Lead:</span>
-            <span className="font-semibold text-zinc-900">
-              {(65.0 / Math.tan((sensorAngleDeg * Math.PI) / 180)).toFixed(0)} cm
-            </span>
+        {/* 2. Measured Slant Distance (R) */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Measured Slant (R)</span>
+            <Radio className="w-3 h-3 text-zinc-400" />
           </div>
+          <span className="text-xs font-bold text-orange-600 block mt-0.5">{hudStats.slantDistanceCm} cm</span>
+          <span className="text-[10px] text-zinc-500 block">{hudStats.slantDistanceM} m | {hudStats.slantDistanceFt} ft</span>
+        </div>
+
+        {/* 3. Surface Deviation (Delta d) */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Surface Dev (Δd)</span>
+            <ArrowUpDown className="w-3 h-3 text-zinc-400" />
+          </div>
+          <span className={`text-xs font-bold block mt-0.5 ${hudStats.deviationCm > 4.5 ? "text-rose-600" : hudStats.deviationCm < -4.5 ? "text-blue-600" : "text-zinc-900"}`}>
+            {hudStats.deviationCm > 0 ? `+${hudStats.deviationCm}` : hudStats.deviationCm} cm
+          </span>
+          <span className="text-[10px] text-zinc-500 block">{hudStats.deviationMm} mm | {hudStats.deviationIn} in</span>
+        </div>
+
+        {/* 4. Lookahead Distance */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Lookahead Lead</span>
+            <Ruler className="w-3 h-3 text-zinc-400" />
+          </div>
+          <span className="text-xs font-bold text-emerald-700 block mt-0.5">{hudStats.earlyWarningLeadM} m</span>
+          <span className="text-[10px] text-zinc-500 block">{hudStats.earlyWarningLeadCm} cm | {hudStats.earlyWarningLeadFt} ft</span>
+        </div>
+
+        {/* 5. Warning Reaction Window */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Time to Impact</span>
+            <Clock className="w-3 h-3 text-zinc-400" />
+          </div>
+          <span className="text-xs font-bold text-indigo-700 block mt-0.5">{hudStats.timeToImpactMs} ms</span>
+          <span className="text-[10px] text-zinc-500 block">{(hudStats.timeToImpactMs / 1000).toFixed(2)} s reaction</span>
+        </div>
+
+        {/* 6. Current Speed */}
+        <div className="border-r border-zinc-100 pr-2">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Vehicle Speed</span>
+            <Gauge className="w-3 h-3 text-zinc-400" />
+          </div>
+          <span className="text-xs font-bold text-zinc-900 block mt-0.5">{hudStats.speedKmph} km/h</span>
+          <span className="text-[10px] text-zinc-500 block">{hudStats.speedMps} m/s | {hudStats.speedMph} mph</span>
+        </div>
+
+        {/* 7. Total Detected Anomalies */}
+        <div>
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-zinc-400 uppercase tracking-wider block">Event Counts</span>
+            <Zap className="w-3 h-3 text-zinc-400" />
+          </div>
+          <span className="text-xs font-bold text-rose-600 block mt-0.5">{hudStats.detectedCount}</span>
+          <span className="text-[10px] text-zinc-500 block">
+            {potholeCount} holes | {bumpCount} bumps
+          </span>
         </div>
       </div>
-
-      {/* Hardware Not Detected Warning Banner (when sync is locked) */}
-      {!isHardwareAvailable && simMode === "generator" && (
-        <div className="bg-zinc-100 border border-zinc-200 rounded-md px-3.5 py-2 text-xs text-zinc-600 flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <Lock className="w-3.5 h-3.5 text-zinc-400" />
-            <span>
-              <strong>Hardware Sync Locked:</strong> Physical sensor disconnected. Operating in Autonomous Simulation mode. Connect USB-UART (/dev/ttyUSB0) to enable live sensor sync.
-            </span>
-          </div>
-          <span className="text-[10px] font-mono text-zinc-400 uppercase">Hardware Offline</span>
-        </div>
-      )}
 
       {/* Main 2D Canvas Viewport */}
-      <div className="relative w-full h-[400px] bg-black border border-zinc-800 rounded-lg overflow-hidden shadow-sm">
-        <canvas
-          ref={canvasRef}
-          className="w-full h-full block cursor-crosshair"
-        />
+      <div className="relative w-full h-[430px] bg-black border border-zinc-800 rounded-lg overflow-hidden shadow-sm">
+        <canvas ref={canvasRef} className="w-full h-full block cursor-crosshair" />
 
         {/* Top Left Live HUD Badges */}
         <div className="absolute top-3 left-3 flex items-center space-x-2 pointer-events-none">
-          {/* Surface Status Callout */}
           <div
-            className={`px-3 py-1.5 rounded-md border text-xs font-mono font-semibold flex items-center space-x-2 shadow-md ${hudStats.isAlert
-              ? hudStats.surfaceType === "Deep Pothole"
-                ? "bg-red-600 text-white border-red-700 animate-pulse"
-                : "bg-amber-500 text-white border-amber-600"
-              : "bg-zinc-900 text-zinc-100 border-zinc-700"
-              }`}
+            className={`px-3 py-1.5 rounded-md border text-xs font-mono font-semibold flex items-center space-x-2 shadow-md ${
+              hudStats.isAlert
+                ? hudStats.surfaceType.includes("Deep")
+                  ? "bg-red-600 text-white border-red-700 animate-pulse"
+                  : "bg-amber-500 text-white border-amber-600"
+                : "bg-zinc-900/95 text-zinc-100 border-zinc-700"
+            }`}
           >
-            {hudStats.isAlert ? (
-              <AlertTriangle className="w-4 h-4" />
-            ) : (
-              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-            )}
+            {hudStats.isAlert ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
             <span>{hudStats.surfaceType}</span>
           </div>
 
-          {/* Measured Slant Range & Vertical Depth */}
-          <div className="bg-zinc-900/90 text-zinc-200 border border-zinc-700 px-3 py-1.5 rounded-md text-xs font-mono shadow-md">
-            Angle: <span className="font-bold text-orange-400">{sensorAngleDeg.toFixed(1)}°</span>
+          <div className="bg-zinc-900/90 text-zinc-200 border border-zinc-700 px-3 py-1.5 rounded-md text-xs font-mono shadow-md hidden sm:block">
+            Base d₀: <span className="font-bold text-amber-400">{hudStats.baseValueCm} cm</span>
             <span className="mx-2 text-zinc-600">|</span>
-            Slant R: <span className="font-bold text-white">{hudStats.slantDistanceCm.toFixed(1)} cm</span>
+            Slant R: <span className="font-bold text-white">{hudStats.slantDistanceCm} cm</span>
             <span className="mx-2 text-zinc-600">|</span>
-            Vert h: <span className="font-bold text-white">{hudStats.verticalDepthCm.toFixed(1)} cm</span>
-            <span className={`ml-2 font-bold ${hudStats.deviationCm > 4.5 ? "text-red-400" : hudStats.deviationCm < -4.5 ? "text-blue-400" : "text-zinc-400"}`}>
-              (Δ {hudStats.deviationCm > 0 ? "+" : ""}{hudStats.deviationCm.toFixed(1)} cm)
-            </span>
+            Lead: <span className="font-bold text-emerald-400">{hudStats.earlyWarningLeadM} m</span>
           </div>
         </div>
 
         {/* Top Right Early Warning and Session Counts */}
         <div className="absolute top-3 right-3 flex items-center space-x-2 pointer-events-none">
           <div className="bg-zinc-900/90 text-zinc-200 border border-zinc-700 px-2.5 py-1.5 rounded-md text-xs font-mono shadow-md">
-            Lookahead: <span className="font-semibold text-emerald-400">{hudStats.earlyWarningLeadCm} cm ahead of tire</span>
-          </div>
-          <div className="bg-zinc-900/90 text-zinc-200 border border-zinc-700 px-2.5 py-1.5 rounded-md text-xs font-mono shadow-md">
             Speed: <span className="font-semibold text-white">{hudStats.speedKmph} km/h</span>
           </div>
           <div className="bg-zinc-900/90 text-zinc-200 border border-zinc-700 px-2.5 py-1.5 rounded-md text-xs font-mono shadow-md">
-            Detected: <span className="font-semibold text-red-400">{hudStats.detectedCount}</span>
+            Events: <span className="font-semibold text-rose-400">{hudStats.detectedCount}</span>
           </div>
         </div>
 
@@ -1901,7 +1632,7 @@ export default function RoadSimulation2D({
           <input
             type="range"
             min="10"
-            max="80"
+            max="100"
             step="5"
             value={simSpeedKmph}
             onChange={(e) => setSimSpeedKmph(Number(e.target.value))}
@@ -1913,7 +1644,7 @@ export default function RoadSimulation2D({
             }}
             className="w-24 accent-white cursor-pointer h-1.5"
           />
-          <span className="font-bold text-white w-10">{simSpeedKmph} km/h</span>
+          <span className="font-bold text-white w-16">{simSpeedKmph} km/h</span>
         </div>
 
         {/* Bottom Right Auto Spawn Toggle */}
@@ -1922,75 +1653,156 @@ export default function RoadSimulation2D({
             <span className="text-zinc-400">Hazards (H):</span>
             <button
               onClick={() => setAutoSpawn(!autoSpawn)}
-              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${autoSpawn ? "bg-emerald-600 text-white" : "bg-zinc-700 text-zinc-300"
-                }`}
+              className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                autoSpawn ? "bg-emerald-600 text-white" : "bg-zinc-700 text-zinc-300"
+              }`}
             >
-              {autoSpawn ? "ENABLED" : "PAUSED"}
+              {autoSpawn ? "AUTO SPAWN ON" : "MANUAL ONLY"}
             </button>
           </div>
         )}
       </div>
 
-      {/* Technical Specifications & Session Event Log */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-
-        {/* Simulation Session Detections */}
-        <div className="lg:col-span-6 bg-white border border-zinc-200 rounded-lg p-3.5 space-y-2">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-semibold text-zinc-900 uppercase tracking-wider">
-              Simulation Detection Log
+      {/* Comprehensive Road Anomaly Event Records Table (Synced with Backend & Dashboard) */}
+      <div className="bg-white border border-zinc-200 rounded-lg p-4 space-y-3">
+        {/* Header & Filter Controls */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-zinc-100 pb-3">
+          <div className="flex items-center space-x-2">
+            <ListFilter className="w-4 h-4 text-zinc-700" />
+            <h3 className="text-xs font-bold text-zinc-900 uppercase tracking-wider">
+              Road Anomaly Event Records ({simMode === "hardware" ? "Live Sensor" : "5m Simulation"})
             </h3>
-            <span className="text-[10px] text-zinc-500 font-mono">
-              {sessionDetections.length} Anomaly Events Recorded
+            <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-700 border border-zinc-200 font-mono font-semibold">
+              {filteredEventRecords.length} recorded
             </span>
           </div>
 
-          <div className="overflow-x-auto max-h-48 overflow-y-auto border border-zinc-100 rounded">
-            <table className="min-w-full text-xs text-left font-mono">
-              <thead className="bg-zinc-50 text-zinc-500 text-[10px] uppercase border-b border-zinc-200">
-                <tr>
-                  <th className="px-3 py-1.5">Time</th>
-                  <th className="px-3 py-1.5">Anomaly Type</th>
-                  <th className="px-3 py-1.5">Depth</th>
-                  <th className="px-3 py-1.5">Slant Range</th>
-                  <th className="px-3 py-1.5">Angle</th>
-                  <th className="px-3 py-1.5">Severity</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-100 text-zinc-700">
-                {sessionDetections.length > 0 ? (
-                  sessionDetections.map((d) => (
+          <div className="flex flex-wrap items-center gap-2 font-mono">
+            {/* Quick Search */}
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-zinc-400" />
+              <input
+                type="text"
+                placeholder="Filter events..."
+                value={eventSearch}
+                onChange={(e) => setEventSearch(e.target.value)}
+                className="bg-zinc-50 text-zinc-900 text-xs rounded-md pl-8 pr-3 py-1 border border-zinc-300 focus:outline-none focus:border-zinc-500 w-36 sm:w-44"
+              />
+            </div>
+
+            {/* Type filter */}
+            <select
+              value={eventFilter}
+              onChange={(e) => setEventFilter(e.target.value)}
+              className="bg-zinc-50 text-zinc-900 text-xs rounded-md px-2 py-1 border border-zinc-300 focus:outline-none focus:border-zinc-500"
+            >
+              <option value="ALL">All Hazards</option>
+              <option value="POTHOLE">Potholes Only</option>
+              <option value="DEEP">Deep / Dangerous Only</option>
+              <option value="BUMP">Speed Bumps Only</option>
+            </select>
+
+            {/* Export CSV */}
+            <button
+              onClick={exportCsv}
+              disabled={combinedEventRecords.length === 0}
+              className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium bg-zinc-100 text-zinc-700 hover:bg-zinc-200 disabled:opacity-40 rounded-md border border-zinc-300 transition"
+            >
+              <Download className="w-3 h-3" />
+              <span className="hidden sm:inline">Export</span>
+            </button>
+
+            {/* Clear Log */}
+            {onClearLog && (
+              <button
+                onClick={onClearLog}
+                disabled={combinedEventRecords.length === 0}
+                className="flex items-center space-x-1 px-2.5 py-1 text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 disabled:opacity-40 rounded-md border border-rose-200 transition"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span className="hidden sm:inline">Clear</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Scrollable Event Log Table */}
+        <div className="overflow-x-auto max-h-64 overflow-y-auto border border-zinc-100 rounded">
+          <table className="min-w-full text-xs text-left font-mono">
+            <thead className="bg-zinc-50 text-zinc-500 text-[10px] uppercase border-b border-zinc-200 sticky top-0">
+              <tr>
+                <th className="px-3 py-2">Time</th>
+                <th className="px-3 py-2">Classification</th>
+                <th className="px-3 py-2">Deviation vs Base (d₀)</th>
+                <th className="px-3 py-2">Depth / Height</th>
+                <th className="px-3 py-2">Length × Width</th>
+                <th className="px-3 py-2">Slant Range (R)</th>
+                <th className="px-3 py-2">Lookahead Lead</th>
+                <th className="px-3 py-2">Severity</th>
+                <th className="px-3 py-2">Confidence</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-100 text-zinc-700">
+              {filteredEventRecords.length > 0 ? (
+                filteredEventRecords.map((d) => {
+                  const itemType = String(d.type || "Anomaly");
+                  const isDeepItem = itemType.toLowerCase().includes("deep") || String(d.severity || "").toLowerCase().includes("deep");
+                  const isPotholeItem = itemType.toLowerCase().includes("pothole");
+                  const isBumpItem = itemType.toLowerCase().includes("bump");
+
+                  return (
                     <tr key={d.id} className="hover:bg-zinc-50">
-                      <td className="px-3 py-1 text-zinc-500">{d.time}</td>
-                      <td className="px-3 py-1 font-semibold">
-                        <span className={d.type.includes("Deep") ? "text-red-600" : d.type.includes("Pothole") ? "text-amber-600" : "text-blue-600"}>
-                          {d.type}
+                      <td className="px-3 py-1.5 text-zinc-500">{d.time}</td>
+                      <td className="px-3 py-1.5 font-semibold">
+                        <span className={isDeepItem ? "text-red-600" : isPotholeItem ? "text-amber-600" : isBumpItem ? "text-blue-600" : "text-zinc-900"}>
+                          {itemType}
                         </span>
                       </td>
-                      <td className="px-3 py-1">{d.depth_cm} cm</td>
-                      <td className="px-3 py-1">{d.slant_range_cm} cm</td>
-                      <td className="px-3 py-1">{d.angle_deg}°</td>
-                      <td className="px-3 py-1">
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${d.severity === "Critical" ? "bg-red-50 text-red-700 border border-red-200" : "bg-amber-50 text-amber-700 border border-amber-200"}`}>
-                          {d.severity}
+                      <td className="px-3 py-1.5 font-bold text-zinc-800">
+                        {d.deviation_cm ? `${d.deviation_cm} cm` : `${d.depth_cm ? `+${d.depth_cm}` : "0"} cm`}
+                      </td>
+                      <td className="px-3 py-1.5 font-bold text-zinc-950">
+                        {d.depth_cm} cm {d.depth_in && <span className="text-zinc-400 font-normal">({d.depth_in} in)</span>}
+                      </td>
+                      <td className="px-3 py-1.5 text-zinc-600">
+                        {d.length_cm || 0} × {d.width_cm || 0} cm {d.length_ft && <span className="text-zinc-400">({d.length_ft} ft)</span>}
+                      </td>
+                      <td className="px-3 py-1.5 text-zinc-800 font-medium">
+                        {d.slant_range_cm ? `${d.slant_range_cm} cm` : `${d.baseline || baseValueCm} cm`}
+                      </td>
+                      <td className="px-3 py-1.5 text-emerald-700 font-medium">
+                        {d.lead_dist_m ? `${d.lead_dist_m} m` : "4.93 m"}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                            String(d.severity || "").includes("Deep") || String(d.severity || "") === "Critical"
+                              ? "bg-red-50 text-red-700 border border-red-200"
+                              : "bg-amber-50 text-amber-700 border border-amber-200"
+                          }`}
+                        >
+                          {d.severity || "Moderate"}
                         </span>
+                      </td>
+                      <td className="px-3 py-1.5 text-zinc-500">
+                        {d.confidence || "Rule"}
                       </td>
                     </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={6} className="px-3 py-4 text-center text-zinc-400">
-                      No simulation detections yet. Drive the motorbike forward or click "+ Deep Pothole" to trigger an event.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+                  );
+                })
+              ) : (
+                <tr>
+                  <td colSpan={9} className="px-3 py-6 text-center text-zinc-400">
+                    No matching event records found. Drive forward or press key 1 / 2 / 3 to spawn road anomalies.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
-      {/* Keyboard Shortcuts Cheat Sheet Modal */}
+      {/* Keyboard Shortcuts Modal */}
       {showShortcutsModal && (
         <div
           onClick={() => setShowShortcutsModal(false)}
@@ -2004,29 +1816,22 @@ export default function RoadSimulation2D({
               <div className="flex items-center space-x-2">
                 <Keyboard className="w-4 h-4 text-zinc-700" />
                 <h3 className="text-xs font-bold text-zinc-900 uppercase tracking-wider">
-                  Simulation Keyboard Shortcuts
+                  Simulation Keyboard Controls
                 </h3>
               </div>
-              <button
-                onClick={() => setShowShortcutsModal(false)}
-                className="text-zinc-400 hover:text-zinc-700 transition"
-              >
+              <button onClick={() => setShowShortcutsModal(false)} className="text-zinc-400 hover:text-zinc-700 transition">
                 <X className="w-4 h-4" />
               </button>
             </div>
 
             <div className="space-y-2 text-xs">
               <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">Space</kbd>
-                </div>
+                <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold w-fit">Space</kbd>
                 <span className="text-zinc-600 text-right">Pause / Resume</span>
               </div>
 
               <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">R</kbd>
-                </div>
+                <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold w-fit">R</kbd>
                 <span className="text-zinc-600 text-right">Reset Sim & Data</span>
               </div>
 
@@ -2036,7 +1841,7 @@ export default function RoadSimulation2D({
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">2</kbd>
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">3</kbd>
                 </div>
-                <span className="text-zinc-600 text-right">Spawn Anomaly</span>
+                <span className="text-zinc-600 text-right">Spawn Pothole / Deep / Bump</span>
               </div>
 
               <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
@@ -2058,41 +1863,17 @@ export default function RoadSimulation2D({
               </div>
 
               <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">A</kbd>
-                  <span className="text-[10px] text-zinc-400">/</span>
-                  <kbd className="px-1.5 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">]</kbd>
-                </div>
-                <span className="text-zinc-600 text-right">Angle MoveUp (+0.5°)</span>
-              </div>
-
-              <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">D</kbd>
-                  <span className="text-[10px] text-zinc-400">/</span>
-                  <kbd className="px-1.5 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">[</kbd>
-                </div>
-                <span className="text-zinc-600 text-right">Angle Down (-0.5°)</span>
-              </div>
-
-              <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">H</kbd>
-                </div>
+                <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold w-fit">H</kbd>
                 <span className="text-zinc-600 text-right">Toggle Road Hazards</span>
               </div>
 
               <div className="grid grid-cols-2 py-1.5 border-b border-zinc-100 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">P</kbd>
-                </div>
+                <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold w-fit">P</kbd>
                 <span className="text-zinc-600 text-right">Cycle Road Preset</span>
               </div>
 
               <div className="grid grid-cols-2 py-1.5 items-center">
-                <div className="flex items-center space-x-1">
-                  <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold">?</kbd>
-                </div>
+                <kbd className="px-2 py-0.5 bg-zinc-100 border border-zinc-300 rounded text-zinc-800 font-bold w-fit">?</kbd>
                 <span className="text-zinc-600 text-right">Toggle Shortcuts Modal</span>
               </div>
             </div>

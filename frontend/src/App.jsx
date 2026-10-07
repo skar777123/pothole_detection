@@ -16,7 +16,7 @@ export default function App() {
   const [status, setStatus] = useState("disconnected");
   const [statusMessage, setStatusMessage] = useState("Sensor not connected");
   const [selectedPort, setSelectedPort] = useState(() => {
-    return localStorage.getItem("pothole_selected_port") || "COM3";
+    return localStorage.getItem("pothole_selected_port") || "auto";
   });
   const [availablePorts, setAvailablePorts] = useState([]);
   const [baudRate, setBaudRate] = useState(() => {
@@ -167,7 +167,8 @@ export default function App() {
     const connectWs = () => {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const host = window.location.hostname || "localhost";
-      const wsUrl = `${protocol}//${host}:8000/ws`;
+      const wsPort = window.location.port === "3000" ? "8000" : (window.location.port || (protocol === "wss:" ? "443" : "80"));
+      const wsUrl = `${protocol}//${host}:${wsPort}/ws`;
 
       ws = new WebSocket(wsUrl);
       wsRef.current = ws;
@@ -454,6 +455,11 @@ export default function App() {
               onResetSimulation={handleResetMetrics}
               onSimulatedAnomaly={handleSimulatedAnomaly}
               onSpeedChange={(speed) => handleSaveSettings({ ...settings, speed_kmph: speed })}
+              logs={logs}
+              onClearLog={handleClearLog}
+              potholeCount={potholeCount}
+              bumpCount={bumpCount}
+              lastDepth={lastDepth}
             />
           </>
         )}
