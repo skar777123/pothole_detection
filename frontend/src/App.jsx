@@ -2,17 +2,16 @@ import React, { useState, useEffect, useRef } from "react";
 import Navbar from "./components/Navbar";
 import ConnectionPanel from "./components/ConnectionPanel";
 import TelemetryCards from "./components/TelemetryCards";
-import DetectionAlert from "./components/DetectionAlert";
 import LiveCharts from "./components/LiveCharts";
 import DetectionLog from "./components/DetectionLog";
 import DiagnosticModal from "./components/DiagnosticModal";
 import SettingsModal from "./components/SettingsModal";
 import RoadSimulation2D from "./components/RoadSimulation2D";
+import { Maximize2, X } from "lucide-react";
 
 export default function App() {
   // Connection state
   const [connected, setConnected] = useState(false);
-  const [isSimulated, setIsSimulated] = useState(false);
   const [status, setStatus] = useState("disconnected");
   const [statusMessage, setStatusMessage] = useState("Sensor not connected");
   const [selectedPort, setSelectedPort] = useState(() => {
@@ -28,10 +27,8 @@ export default function App() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
 
-  // Active page view: "dashboard" or "simulation"
-  const [activeTab, setActiveTab] = useState(() => {
-    return localStorage.getItem("pothole_active_tab") || "dashboard";
-  });
+  // Mobile Canvas Fullscreen State
+  const [isMobileCanvasOpen, setIsMobileCanvasOpen] = useState(false);
 
   // Reset trigger counter for simulation sync
   const [resetTrigger, setResetTrigger] = useState(0);
@@ -54,6 +51,7 @@ export default function App() {
     is_alert: false,
     alert_message: "",
     cooldown_remaining: 0,
+    pi_temperature: null,
   });
 
   const [potholeCount, setPotholeCount] = useState(0);
@@ -124,7 +122,6 @@ export default function App() {
       const data = await res.json();
       if (data) {
         setConnected(data.connected);
-        setIsSimulated(data.is_simulated);
         setStatus(data.status);
         setStatusMessage(data.status_message);
         if (data.port) setSelectedPort(data.port);
@@ -177,7 +174,6 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
           setConnected(data.connected);
-          setIsSimulated(data.is_simulated);
           setStatus(data.status);
           setStatusMessage(data.status_message);
           if (data.port) setSelectedPort(data.port);
@@ -230,8 +226,8 @@ export default function App() {
     };
   }, []);
 
-  // Connect to hardware or simulation
-  const handleConnect = async (simulate = false) => {
+  // Connect to hardware
+  const handleConnect = async () => {
     setIsConnecting(true);
     setStatus("connecting");
     setStatusMessage(`Connecting to ${selectedPort} at ${baudRate} baud...`);
@@ -242,12 +238,10 @@ export default function App() {
         body: JSON.stringify({
           port: selectedPort,
           baudrate: baudRate,
-          simulate: simulate,
         }),
       });
       const data = await res.json();
       setConnected(data.success);
-      setIsSimulated(Boolean(data.simulated));
       setStatus(data.success ? "connected" : "error");
       setStatusMessage(data.message);
     } catch (err) {
@@ -265,20 +259,10 @@ export default function App() {
       const res = await fetch("/api/disconnect", { method: "POST" });
       const data = await res.json();
       setConnected(false);
-      setIsSimulated(false);
       setStatus("disconnected");
       setStatusMessage(data.message || "Disconnected");
     } catch (err) {
       setStatusMessage(`Disconnect error: ${err.message}`);
-    }
-  };
-
-  // Toggle simulation
-  const handleToggleSimulate = () => {
-    if (isSimulated && connected) {
-      handleDisconnect();
-    } else {
-      handleConnect(true);
     }
   };
 
@@ -306,14 +290,6 @@ export default function App() {
       } catch {}
     }
   }, [logs]);
-
-  useEffect(() => {
-    if (activeTab) {
-      try {
-        localStorage.setItem("pothole_active_tab", activeTab);
-      } catch {}
-    }
-  }, [activeTab]);
 
   // Reset metrics and clear detection cache
   const handleResetMetrics = async () => {
@@ -366,104 +342,141 @@ export default function App() {
     } catch {}
   };
 
-  // Handle anomalies detected in 2D simulation mode
-  const handleSimulatedAnomaly = (anomaly) => {
-    if (anomaly.type.includes("Pothole")) {
-      setPotholeCount((prev) => prev + 1);
-    } else if (anomaly.type.includes("Bump")) {
-      setBumpCount((prev) => prev + 1);
+  // Fullscreen open/close logic
+  const openCanvasFullscreen = async () => {
+    setIsMobileCanvasOpen(true);
+    try {
+      const el = document.documentElement;
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
+      }
+      if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
+        await window.screen.orientation.lock("landscape");
+      }
+    } catch (err) {
+      console.warn("Fullscreen or orientation lock failed:", err);
     }
-    setLastDepth(anomaly.depth_cm);
-    setLogs((prev) => [anomaly, ...prev.slice(0, 99)]);
+  };
+
+  const closeCanvasFullscreen = async () => {
+    setIsMobileCanvasOpen(false);
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+      if (window.screen && window.screen.orientation && window.screen.orientation.unlock) {
+        window.screen.orientation.unlock();
+      }
+    } catch (err) {
+      console.warn("Exit fullscreen failed:", err);
+    }
   };
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 flex flex-col font-sans">
-      {/* Top Navigation with Page Switcher */}
+      {/* Top Navigation */}
       <Navbar
         connected={connected}
-        isSimulated={isSimulated}
         status={status}
-        activeTab={activeTab}
-        onTabChange={setActiveTab}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenDiagnostic={() => setIsDiagnosticOpen(true)}
         onResetMetrics={handleResetMetrics}
         isResetting={isResetting}
       />
 
-      {/* Main Body: Dynamic Page Rendering */}
+      {/* Main Body */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 space-y-4">
-        {activeTab === "dashboard" ? (
-          <>
-            {/* Connection and Hardware Status Panel */}
-            <ConnectionPanel
-              connected={connected}
-              isSimulated={isSimulated}
-              status={status}
-              statusMessage={statusMessage}
-              selectedPort={selectedPort}
-              setSelectedPort={setSelectedPort}
-              availablePorts={availablePorts}
-              onRefreshPorts={fetchPorts}
-              baudRate={baudRate}
-              setBaudRate={setBaudRate}
-              onConnect={handleConnect}
-              onDisconnect={handleDisconnect}
-              onToggleSimulate={handleToggleSimulate}
-              framesReceived={framesReceived}
-              errorsCount={errorsCount}
-              isConnecting={isConnecting}
-            />
+        {/* Connection and Hardware Status Panel */}
+        <ConnectionPanel
+          connected={connected}
+          status={status}
+          statusMessage={statusMessage}
+          selectedPort={selectedPort}
+          setSelectedPort={setSelectedPort}
+          availablePorts={availablePorts}
+          onRefreshPorts={fetchPorts}
+          baudRate={baudRate}
+          setBaudRate={setBaudRate}
+          onConnect={handleConnect}
+          onDisconnect={handleDisconnect}
+          framesReceived={framesReceived}
+          errorsCount={errorsCount}
+          isConnecting={isConnecting}
+        />
 
-            {/* Telemetry Metrics Row */}
-            <TelemetryCards
-              telemetry={telemetry}
-              potholeCount={potholeCount}
-              bumpCount={bumpCount}
-              lastDepth={lastDepth}
-            />
+        {/* Telemetry Metrics Row */}
+        <TelemetryCards
+          telemetry={telemetry}
+          potholeCount={potholeCount}
+          bumpCount={bumpCount}
+          lastDepth={lastDepth}
+        />
 
-            {/* Live Surface Condition Banner */}
-            <DetectionAlert telemetry={telemetry} />
+        {/* Mobile "Open Canvas" Button (Hidden on Desktop) */}
+        <div className="block lg:hidden">
+          <button
+            onClick={openCanvasFullscreen}
+            className="w-full flex items-center justify-center space-x-2 bg-zinc-900 hover:bg-zinc-800 text-white py-3 rounded-xl font-semibold shadow-sm transition"
+          >
+            <Maximize2 className="w-5 h-5" />
+            <span>Open 2D Bike Canvas</span>
+          </button>
+        </div>
 
-            {/* Telemetry Waveforms */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-                  Sensor Waveforms (10 Hz Telemetry)
-                </h2>
-                <span className="text-[10px] text-zinc-500 font-mono">
-                  Window: 100 samples
-                </span>
-              </div>
-              <LiveCharts history={history} />
-            </div>
+        {/* Desktop Embedded Canvas / Landscape Container */}
+        <div className="hidden lg:block w-full bg-white rounded-xl shadow-sm border border-zinc-200 overflow-hidden">
+          <RoadSimulation2D
+            telemetry={telemetry}
+            connected={connected}
+            settings={settings}
+            onSpeedChange={(speed) => handleSaveSettings({ ...settings, speed_kmph: speed })}
+          />
+        </div>
 
-            {/* Anomaly Detection Log Table */}
-            <DetectionLog logs={logs} onClearLog={handleClearLog} />
-          </>
-        ) : (
-          <>
-            {/* Dedicated 2D Motorbike Road & Pothole Simulation Page */}
-            <RoadSimulation2D
-              telemetry={telemetry}
-              connected={connected}
-              isSimulated={isSimulated}
-              settings={settings}
-              resetTrigger={resetTrigger}
-              onResetSimulation={handleResetMetrics}
-              onSimulatedAnomaly={handleSimulatedAnomaly}
-              onSpeedChange={(speed) => handleSaveSettings({ ...settings, speed_kmph: speed })}
-              logs={logs}
-              onClearLog={handleClearLog}
-              potholeCount={potholeCount}
-              bumpCount={bumpCount}
-              lastDepth={lastDepth}
-            />
-          </>
-        )}
+        {/* Telemetry Waveforms */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+              Sensor Waveforms (10 Hz Telemetry)
+            </h2>
+            <span className="text-[10px] text-zinc-500 font-mono">
+              Window: 100 samples
+            </span>
+          </div>
+          <LiveCharts history={history} />
+        </div>
+
+        {/* Anomaly Detection Log Table */}
+        <DetectionLog logs={logs} onClearLog={handleClearLog} />
       </main>
+
+      {/* Mobile Fullscreen Canvas Overlay */}
+      {isMobileCanvasOpen && (
+        <div className="fixed inset-0 z-50 bg-black flex flex-col">
+          <div className="flex items-center justify-between px-4 py-2 bg-zinc-900 text-white shadow-md z-10 shrink-0">
+            <div className="flex flex-col">
+              <span className="text-sm font-semibold">2D Bike Canvas</span>
+            </div>
+            <button
+              onClick={closeCanvasFullscreen}
+              className="p-1.5 rounded-full bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <div className="flex-1 w-full bg-zinc-950 relative overflow-hidden flex items-center justify-center">
+            {/* The RoadSimulation2D component should fit inside without scrolling */}
+            <div className="w-full h-full max-h-[100vh] flex flex-col justify-center">
+                <RoadSimulation2D
+                  telemetry={telemetry}
+                  connected={connected}
+                  settings={settings}
+                  onSpeedChange={(speed) => handleSaveSettings({ ...settings, speed_kmph: speed })}
+                />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Hardware Diagnostic Modal */}
       <DiagnosticModal
@@ -471,7 +484,6 @@ export default function App() {
         onClose={() => setIsDiagnosticOpen(false)}
         selectedPort={selectedPort}
         baudRate={baudRate}
-        isSimulated={isSimulated}
       />
 
       {/* Settings Modal */}

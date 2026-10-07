@@ -129,12 +129,12 @@ export default function ConnectionPanel({
               {availablePorts.length > 0 ? (
                 availablePorts.map((p) => (
                   <option key={p} value={p}>
-                    {p === "auto" ? "⚡ Auto-Detect (Scan Ports)" : p}
+                    {p === "auto" ? " Auto-Detect (Scan Ports)" : p}
                   </option>
                 ))
               ) : (
                 <>
-                  <option value="auto">⚡ Auto-Detect (Scan Ports)</option>
+                  <option value="auto"> Auto-Detect (Scan Ports)</option>
                   <option value={selectedPort}>{selectedPort} (Manual)</option>
                 </>
               )}
@@ -181,11 +181,10 @@ export default function ConnectionPanel({
 
           <button
             onClick={onToggleSimulate}
-            className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition ${
-              isSimulated
+            className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition ${isSimulated
                 ? "bg-zinc-900 text-white border-zinc-900"
                 : "bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-50"
-            }`}
+              }`}
             title="Toggle simulated 100 Hz sensor stream"
           >
             <Cpu className="w-3.5 h-3.5" />
