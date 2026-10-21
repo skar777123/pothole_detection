@@ -17,9 +17,11 @@ Usage
   python evaluate.py --from-csv    # also test against real CSV rows
 """
 
-import os, sys, json, argparse, warnings
+import os, sys, json, argparse, warnings, io
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 warnings.filterwarnings("ignore")
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
@@ -120,34 +122,30 @@ def plot_confidence_violin(probs_by_class: dict, save_path: str):
     print(f"  Confidence violin → {save_path}")
 
 
-def gradcam_1d(model, X_sample: np.ndarray, class_id: int,
-               layer_name: str = "bilstm_1") -> np.ndarray:
+def gradcam_1d(model, X_sample: np.ndarray, class_id: int) -> np.ndarray:
     """
-    Compute Grad-CAM saliency over the time axis for a single sample.
+    Compute input-level saliency (Gradient x Input) over the time axis for a single sample.
     Returns a (WINDOW_SIZE,) saliency map.
     """
     import tensorflow as tf
 
-    # Build sub-model up to the target hidden layer
-    try:
-        target_layer = model.get_layer(layer_name)
-        grad_model = tf.keras.Model(
-            inputs  = model.inputs,
-            outputs = [target_layer.output, model.output]
-        )
-    except ValueError:
-        return np.ones(WINDOW_SIZE)
-
     x = tf.constant(X_sample[np.newaxis], dtype=tf.float32)
     with tf.GradientTape() as tape:
         tape.watch(x)
-        layer_out, preds = grad_model(x, training=False)
+        preds = model(x, training=False)
         loss = preds[0, class_id]
 
-    grads     = tape.gradient(loss, layer_out)[0]    # (T, F)
-    weights   = tf.reduce_mean(grads, axis=-1)       # (T,)
-    cam       = tf.nn.relu(weights).numpy()
-    cam_norm  = cam / (cam.max() + 1e-8)
+    grads = tape.gradient(loss, x)
+    if grads is None:
+        return np.ones(WINDOW_SIZE)
+
+    # Gradient x Input saliency per timestep
+    saliency = tf.reduce_sum(tf.abs(grads[0] * x[0]), axis=-1).numpy()
+    max_val = saliency.max()
+    if max_val > 1e-8:
+        cam_norm = saliency / max_val
+    else:
+        cam_norm = np.ones(WINDOW_SIZE)
     return cam_norm
 
 
@@ -282,7 +280,7 @@ def main():
         },
     }
     summary_path = os.path.join(LOGS_DIR, "evaluation_summary.json")
-    with open(summary_path, "w") as f:
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(f"\n  Summary saved → {summary_path}")
 

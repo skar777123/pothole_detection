@@ -695,7 +695,7 @@ export default function RoadSimulation2D({
 
       ctx.fillStyle = "rgba(234, 179, 8, 0.7)";
       ctx.font = "bold 9px monospace";
-      ctx.fillText(`Nominal Ground Baseline (d₀ = ${baseValueCm.toFixed(1)} cm)`, 12, baselineY - 6);
+      ctx.fillText(`Nominal Ground Baseline (d₀ = ${baseValueCm.toFixed(1)} cm)`, 12, baselineY + 12);
 
       // 3. MOTORBIKE POSITION & SUSPENSION DYNAMICS
       // Economic Commuter Motorcycle geometry (Wheelbase: 110px, Wheel radius: 18px)
@@ -1310,7 +1310,7 @@ export default function RoadSimulation2D({
       const midY = (lidarOriginY + hitY) / 2;
       ctx.fillStyle = "#f97316";
       ctx.font = "bold 9px monospace";
-      ctx.fillText(`5.0m Ray (R: ${measuredSlantM.toFixed(2)}m / ${measuredSlantFt.toFixed(1)}ft)`, midX + 12, midY - 6);
+      ctx.fillText(`5.0m Ray (R: ${measuredSlantM.toFixed(2)}m / ${measuredSlantFt.toFixed(1)}ft)`, midX + 12, midY - 20);
 
       // 7. FLOATING HAZARD CALLOUT OVER ACTIVE DETECTED ROAD ANOMALY
       if (isAlert) {
@@ -1542,8 +1542,7 @@ export default function RoadSimulation2D({
           <span className="font-bold text-white w-16">{simSpeedKmph} km/h</span>
         </div>
 
-        {/* Bottom Right Auto Spawn Toggle */}
-        {simMode === "generator" && (
+        {/* {simMode === "generator" && (
           <div className="absolute bottom-3 right-3 bg-zinc-900/95 border border-zinc-700 px-3 py-1.5 rounded-md flex items-center space-x-2 text-xs font-mono text-zinc-300 shadow-md">
             <span className="text-zinc-400">Hazards (H):</span>
             <button
@@ -1554,7 +1553,7 @@ export default function RoadSimulation2D({
               {autoSpawn ? "AUTO SPAWN ON" : "MANUAL ONLY"}
             </button>
           </div>
-        )}
+        )} */}
       </div>
 
       {/* Keyboard Shortcuts Modal */}

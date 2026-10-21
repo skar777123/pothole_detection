@@ -25,6 +25,10 @@ IMPORTANT
   helper functions and constants — it does NOT re-run training.
 """
 
+import sys, io
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 import numpy as np
 from scipy.stats import skew, kurtosis
 from sklearn.ensemble import RandomForestClassifier
@@ -42,8 +46,8 @@ WINDOW_SIZE      = 20          # Readings per inference window
 N_SAMPLES        = 8000        # More samples for wider baseline coverage
 BASELINE_CM      = 1000        # Fixed sensor-to-road distance: 10 m (1000 cm)
 NOISE_STD        = 1.5         # Road surface noise at close range (cm)
-BASELINE_MIN_CM  = 50          # Minimum baseline used during training
-BASELINE_MAX_CM  = 1000        # Maximum baseline used during training (10 m)
+BASELINE_MIN_CM  = 200         # Empirical minimum baseline from field tests (cm)
+BASELINE_MAX_CM  = 1150        # Empirical maximum baseline from field tests (cm)
 POTHOLE_THRESH   = 3.0         # Minimum positive deviation = pothole zone (cm)
 BUMP_THRESH      = 3.0         # Minimum negative deviation = bump zone (cm)
 MODEL_PATH       = "pothole_model.pkl"
@@ -188,8 +192,8 @@ def generate_synthetic_data(n_samples=N_SAMPLES, window_size=WINDOW_SIZE,
     class_configs = [
         (0, "flat",    None),
         (1, "pothole", (3,  8)),
-        (2, "pothole", (9, 25)),
-        (3, "bump",    (3, 15)),
+        (2, "pothole", (9, 35)),
+        (3, "bump",    (3, 30)),
     ]
 
     for cls, etype, depth_range in class_configs:

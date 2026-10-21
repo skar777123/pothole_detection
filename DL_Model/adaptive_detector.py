@@ -58,10 +58,13 @@ Import as module
 
 from __future__ import annotations
 
-import os, sys, time, argparse, threading, queue
+import os, sys, time, argparse, threading, queue, io
 from collections import deque
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
@@ -886,24 +889,40 @@ def run_demo(port: str | None = None, baud: int = 115200,
     # Data source
     if port is not None:
         try:
-            import serial
-            ser = serial.Serial(port, baud, timeout=1)
-            def _serial_gen():
-                buf = b""
+            from lidar_driver import TF02Pro, LiDARReadError
+            lidar = TF02Pro(port=port, baudrate=baud, timeout=0.1, send_init=True)
+            def _tf02_gen():
                 while not stop_event.is_set():
-                    buf += ser.read(16)
-                    while len(buf) >= 9:
-                        if buf[0] == 0x59 and buf[1] == 0x59:
-                            dist = (buf[3] << 8 | buf[2])
-                            strn = (buf[5] << 8 | buf[4])
-                            yield float(dist), float(strn)
-                            buf  = buf[9:]
-                        else:
-                            buf = buf[1:]
-            stream = _serial_gen()
+                    try:
+                        f = lidar.read_frame()
+                        if f.get("valid", True):
+                            yield float(f["distance_cm"]), float(f["strength"])
+                    except LiDARReadError:
+                        time.sleep(0.005)
+            stream = _tf02_gen()
         except Exception as e:
-            print(f"  ⚠  Serial error: {e} – falling back to simulation")
-            stream = _simulate_stream(baseline_cm, hz)
+            print(f"  ⚠  LiDAR driver init error ({e}) – falling back to raw serial with checksum")
+            try:
+                import serial
+                ser = serial.Serial(port, baud, timeout=1)
+                def _serial_gen():
+                    buf = b""
+                    while not stop_event.is_set():
+                        buf += ser.read(16)
+                        while len(buf) >= 9:
+                            if buf[0] == 0x59 and buf[1] == 0x59:
+                                # Validate TF02-Pro checksum
+                                if (sum(buf[:8]) & 0xFF) == buf[8]:
+                                    dist = (buf[3] << 8 | buf[2])
+                                    strn = (buf[5] << 8 | buf[4])
+                                    yield float(dist), float(strn)
+                                buf = buf[9:]
+                            else:
+                                buf = buf[1:]
+                stream = _serial_gen()
+            except Exception as e2:
+                print(f"  ⚠  Serial error: {e2} – falling back to simulation")
+                stream = _simulate_stream(baseline_cm, hz)
     else:
         stream = _simulate_stream(baseline_cm, hz)
 

@@ -291,18 +291,25 @@ class SystemManager:
             return 3
         return 0
 
-    def compute_dimensions(self, dist_buf: List[float], str_buf: List[float], baseline: float) -> Dict[str, Any]:
+    def compute_dimensions(self, dist_buf: List[float], str_buf: List[float], baseline: float, is_bump: bool = False) -> Dict[str, Any]:
         arr = np.array(dist_buf, dtype=float)
         dev = arr - baseline
-        depth_cm = float(max(dev.max(), 0))
-        in_hole = int(np.sum(dev > self.pot_thresh))
+        if is_bump or (abs(float(dev.min())) > float(dev.max())):
+            bump_height = float(abs(min(dev.min(), 0)))
+            in_feature = int(np.sum(dev < -self.bump_thresh))
+            feature_dim = bump_height
+        else:
+            pothole_depth = float(max(dev.max(), 0))
+            in_feature = int(np.sum(dev > self.pot_thresh))
+            feature_dim = pothole_depth
+
         dist_per_reading = self.get_dist_per_reading()
-        length = round(in_hole * dist_per_reading, 1)
+        length = round(max(in_feature, 1) * dist_per_reading, 1)
         return {
-            "depth_cm": round(depth_cm, 1),
+            "depth_cm": round(feature_dim, 1),
             "length_cm": length,
             "width_cm": round(length * 0.8, 1),
-            "severity": self.severity_label(depth_cm),
+            "severity": self.severity_label(feature_dim),
             "avg_strength": round(float(np.mean(str_buf)) if str_buf else 0, 0),
         }
 
@@ -496,7 +503,7 @@ class SystemManager:
                     self.confirm_streak = 0
                     alert_msg = f"{CLASS_LABELS[final_cls]} continuing (Cooldown: {cooldown_rem:.1f}s)"
                 else:
-                    dims = self.compute_dimensions(self.dist_buf, self.str_buf, baseline)
+                    dims = self.compute_dimensions(self.dist_buf, self.str_buf, baseline, is_bump=is_bump)
                     if is_ph:
                         self.pothole_count += 1
                     elif is_bump:

@@ -179,7 +179,7 @@ export default function ConnectionPanel({
             </button>
           )}
 
-          <button
+          {/* <button
             onClick={onToggleSimulate}
             className={`inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-medium border transition ${isSimulated
                 ? "bg-zinc-900 text-white border-zinc-900"
@@ -189,7 +189,7 @@ export default function ConnectionPanel({
           >
             <Cpu className="w-3.5 h-3.5" />
             <span>{isSimulated ? "Stop Sim" : "Simulate"}</span>
-          </button>
+          </button> */}
         </div>
       </div>
     </div>

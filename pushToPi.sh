@@ -4,7 +4,7 @@
 # Push local code changes directly to Raspberry Pi 4B over SSH / rsync / scp.
 #
 # Usage:
-#   ./pushToPi.sh                       # Push to default IP (10.102.135.41)
+#   ./pushToPi.sh                       # Push to default IP (10.102.135.22)
 #   ./pushToPi.sh 192.168.1.100         # Push to custom Pi IP
 #   ./pushToPi.sh --pull                # Instruct Pi to git pull origin main
 #   ./pushToPi.sh --run                 # Sync files and restart application
@@ -14,7 +14,7 @@ set -e
 
 # Configuration
 PI_USER="${PI_USER:-pi}"
-PI_HOST="${1:-10.102.135.64}"
+PI_HOST="${1:-10.102.135.22}"
 PI_DEST="/home/$PI_USER/pothole_detection"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"

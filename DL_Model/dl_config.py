@@ -23,9 +23,9 @@ REPORT_SAVE_PATH    = os.path.join(LOGS_DIR,   "classification_report.txt")
 CONFUSION_SAVE_PATH = os.path.join(LOGS_DIR,   "confusion_matrix.png")
 
 # ── Sensor / Signal constants ─────────────────────────────────────────────────
-BASELINE_CM      = 1000.0   # Fixed sensor-to-road distance (cm)
-BASELINE_MIN_CM  =   50.0   # Minimum baseline in synthetic data
-BASELINE_MAX_CM  = 1000.0   # Maximum baseline in synthetic data
+BASELINE_CM      = 1000.0   # Operational reference distance (cm)
+BASELINE_MIN_CM  =  200.0   # Empirical minimum baseline from real testing (cm)
+BASELINE_MAX_CM  = 1150.0   # Empirical maximum baseline from real testing (cm)
 POTHOLE_THRESH   =    3.0   # Min +deviation to call a pothole (cm)
 BUMP_THRESH      =    3.0   # Min -deviation to call a speed bump (cm)
 NOISE_STD        =    1.5   # Sensor noise std at close range (cm)
@@ -80,14 +80,14 @@ SEVERITY_LEVELS = {
 }
 
 # ── Training Hyperparameters ──────────────────────────────────────────────────
-N_SYNTHETIC_SAMPLES = 20_000   # Synthetic rows per class (×4 = total)
-REAL_AUGMENT_FACTOR =     50   # Each real row is augmented × this many times
+N_SYNTHETIC_SAMPLES =  4_000   # Calibrated: 4,000 per class (x4 = 16,000 synthetic windows)
+REAL_AUGMENT_FACTOR =     50   # 80 clean real rows x 50 = 4,000 real windows (balanced 20% real data)
 
 BATCH_SIZE   =  64
-EPOCHS       = 30
+EPOCHS       = 20
 LEARNING_RATE = 1e-3
-LR_PATIENCE  =  12    # ReduceLROnPlateau patience
-ES_PATIENCE  =  25    # EarlyStopping patience
+LR_PATIENCE  =  4     # ReduceLROnPlateau patience
+ES_PATIENCE  =  7     # EarlyStopping patience
 VALIDATION_SPLIT = 0.15
 TEST_SPLIT       = 0.15
 

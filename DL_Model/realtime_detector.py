@@ -478,9 +478,10 @@ def run_live_demo(port: str = None, baud: int = 115200,
                     # Minimal TF-02 Pro frame parse (9 bytes)
                     while len(buf) >= 9:
                         if buf[0] == 0x59 and buf[1] == 0x59:
-                            dist  = (buf[3] << 8 | buf[2])
-                            strn  = (buf[5] << 8 | buf[4])
-                            yield float(dist), float(strn)
+                            if (sum(buf[:8]) & 0xFF) == buf[8]:
+                                dist  = (buf[3] << 8 | buf[2])
+                                strn  = (buf[5] << 8 | buf[4])
+                                yield float(dist), float(strn)
                             buf  = buf[9:]
                         else:
                             buf = buf[1:]

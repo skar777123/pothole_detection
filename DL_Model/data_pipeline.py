@@ -10,7 +10,10 @@ X shape : (N, WINDOW_SIZE, N_RAW_FEATURES)
 y shape : (N,)  integer class labels  0-3
 """
 
-import os
+import os, sys, io
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 import glob
 import json
 import warnings
@@ -44,12 +47,12 @@ def _noise_for_baseline(baseline_cm: float) -> float:
 def _label_from_type(t: str, dev: float) -> int:
     """Map a raw 'Type' emoji string + deviation to an integer class."""
     t = str(t).lower()
+    if "deep" in t:
+        return 2
     if "shallow" in t or "pothole" in t:
         if abs(dev) < POTHOLE_THRESH:
             return 0
         return 1
-    if "deep" in t:
-        return 2
     if "bump" in t or "speed" in t:
         return 3
     # fallback: sign of deviation
@@ -90,16 +93,20 @@ def load_real_data() -> pd.DataFrame:
             # Rename columns for consistency
             df.columns = [c.strip() for c in df.columns]
             rename = {
-                "Dev (cm)"   : "dev_cm",
-                "Type"       : "type",
-                "Depth (cm)" : "depth_cm",
-                "Length (cm)": "length_cm",
-                "Width (cm)" : "width_cm",
-                "Severity"   : "severity",
-                "Conf."      : "confidence",
-                "Strength"   : "strength",
-                "Baseline"   : "baseline_cm",
-                "Time"       : "time",
+                "Dev (cm)"       : "dev_cm",
+                "Deviation (cm)" : "dev_cm",
+                "Type"           : "type",
+                "Depth (cm)"     : "depth_cm",
+                "Length (cm)"    : "length_cm",
+                "Width (cm)"     : "width_cm",
+                "Severity"       : "severity",
+                "Conf."          : "confidence",
+                "Confidence"     : "confidence",
+                "Strength"       : "strength",
+                "Signal Strength": "strength",
+                "Baseline"       : "baseline_cm",
+                "Baseline (cm)"  : "baseline_cm",
+                "Time"           : "time",
             }
             df.rename(columns=rename, inplace=True)
             # Parse dev_cm: strip "+" sign then coerce to float
@@ -191,11 +198,11 @@ def generate_synthetic_data(n_per_class: int = N_SYNTHETIC_SAMPLES,
         rng = np.random.default_rng(RANDOM_SEED)
 
     class_configs = [
-        # (class_id, event_type, depth_range_cm)
+        # (class_id, event_type, depth_range_cm) - recalibrated from field data
         (0, "flat",    (0,    0)),
         (1, "pothole", (3,    8)),
-        (2, "pothole", (9,   65)),
-        (3, "bump",    (3,   50)),
+        (2, "pothole", (9,   35)),
+        (3, "bump",    (3,   30)),
     ]
 
     X_list, y_list = [], []
@@ -376,7 +383,7 @@ def build_dataset() -> dict:
     X_test  = scale(X_test)
 
     joblib.dump(scaler, SCALER_SAVE_PATH)
-    print(f"  [data_pipeline] Scaler saved → {SCALER_SAVE_PATH}")
+    print(f"  [data_pipeline] Scaler saved -> {SCALER_SAVE_PATH}")
 
     # Class counts for logging
     unique, counts = np.unique(y_train, return_counts=True)
@@ -502,7 +509,7 @@ def build_adaptive_dataset(n_per_class: int = N_SYNTHETIC_SAMPLES) -> dict:
 
     adaptive_scaler_path = os.path.join(MODELS_DIR, "dl_scaler_adaptive.pkl")
     joblib.dump(scaler, adaptive_scaler_path)
-    print(f"  [data_pipeline] Adaptive scaler saved → {adaptive_scaler_path}")
+    print(f"  [data_pipeline] Adaptive scaler saved -> {adaptive_scaler_path}")
 
     return {
         "X_train": X_train, "X_val": X_val, "X_test": X_test,
